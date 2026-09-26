@@ -1,7 +1,86 @@
 # Changelog
 
-All notable changes to `peter.router` are documented here. SemVer; releases are
+All notable changes to `petealeon.router` are documented here. SemVer; releases are
 tagged `vX.Y.Z`.
+
+## [1.3.0] - 2026-09-26
+
+### Added
+- **Full keyboard control.** The panel is now drivable without a mouse, following
+  the same cursor conventions as the built-in panels. The first arrow press only
+  wakes the cursor rather than moving or scrolling, so the panel never jumps on a
+  stray keypress. `j`/`k` move a row, `l`/`h` cross between an app row and the
+  output it is connected to, `Return`/`Space` routes (or, on the header, toggles
+  routing), `x` resets an app to the system default, and `1`–`9` route straight
+  to the nth output. The cursor spans both columns because the two share a row
+  grid, and it is tracked by app/output key rather than row index so it survives
+  the 1s refresh — including an app whose stream stops mid-navigation.
+- **Master routing switch.** The panel header now carries an on/off switch like
+  other built-in Omarchy tools. Turning routing off stops the watcher *and*
+  restores every stream to the system default output (a new `restore` helper
+  subcommand flocks the watch lock, so the dying watcher cannot re-assert pins
+  mid-move); saved rules are untouched, so switching back on re-pins the same
+  apps. The switch reflects effective state — a watcher that died with an
+  exhausted crash budget reads as off, and toggling it back on resets that
+  budget. A short hint tooltip names the action; the bar and hero icons dim
+  while routing is off. The switch is also keyboard-operable now, which it was
+  not before: `ToggleSwitch` is mouse-only, so the header had to become a cursor
+  section.
+- **Header matches built-in panels.** The title row is now `PanelHero` with the
+  link icon, the "Audio Router" name, a two-line interaction hint as meta text,
+  and a horizontal `PanelSeparator` before the link section.
+- **Speaker glyph marks a live source.** A source that is currently producing
+  audio now shows a small speaker icon (accent when pinned, foreground when on
+  the system default) instead of the ambiguous background box; the gutter is
+  reserved on every row so labels stay aligned.
+- **Status notes.** A small note under the header reports a degraded `pactl`
+  read in amber ("routing unavailable …") or, while routing is off, that edits
+  are kept and applied when the switch comes back on. The patch dims in the
+  latter case but stays editable.
+- **`set-rule` helper subcommand.** Same four arguments as `set-sink`, but it
+  only persists the rule and moves nothing. This is what makes the off-state
+  note true: a route set while routing is off is *stored*, not applied, and draws
+  as a dashed line with no endpoint dot so the patch never implies a live route.
+  Resets still apply immediately, since "every stream is already on the default"
+  is exactly what off means.
+
+### Changed
+- **Renamed to `petealeon.router`** (was `peter.router`) to match the GitHub
+  owner and the other plugins in this namespace. The id is also the install
+  directory, the bar entry and the Quickshell module name, so a plain rename
+  would have left the old copy registered and the widget on the bar twice;
+  `install.sh` now migrates it — it stops the old watcher, unregisters
+  `peter.router`, strips its stale bar entry from `shell.json` and removes the
+  old directory, while leaving `~/.config/omarchy/router-rules.json` intact. Both
+  the install and the `--remove`/`--purge` paths run the migration, so no manual
+  step is needed. Upgrading installs `petealeon.router` in the same right-hand
+  bar section.
+- System binaries (`quickshell`, `wireplumber`, `pipewire`, `systemd`, `pactl`,
+  `pw-dump`, portals, …) are now excluded from steering in the helper itself,
+  not just in the panel's row model.
+- `Up`/`Down` no longer scroll the patch. The cursor takes them and scrolling
+  follows the cursor, matching the built-in panels; the wheel is unaffected.
+- README no longer claims a `__default__` output row exists. It does not:
+  resetting is the ring click, an `x`, or a drop on whatever the current default
+  output is.
+
+### Removed
+- The `+` "pre-pin an idle app" button and its picker. It could list system
+  processes such as quickshell or wireplumber, which are never meaningfully
+  routable, and its purpose was not discoverable. Only sources that are
+  actually playing can be routed now.
+- The header health dot, its status text and the version/pid tooltip, all
+  superseded by the routing switch.
+
+### Fixed
+- A latent `NameError` in the helper's `set-sink` path, which the new
+  `set-rule`/`set-sink` selftest coverage now exercises for the first time.
+- The CI QML lint step never actually ran. It gated on `command -v qmllint`,
+  but `qmllint` is not on `PATH` on the distros that ship it, and it passed no
+  import path, so `qs.Ui`/`qs.Commons` could not have resolved. It now installs
+  `qt6-declarative-dev-tools` and calls `scripts/qml-lint.sh`, which locates the
+  binary in the Qt6 tree, builds the `qs.*` import shim when an omarchy shell is
+  present, and fails on parse errors instead of skipping silently.
 
 ## [1.2.1] - 2026-09-26
 

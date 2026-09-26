@@ -6,13 +6,19 @@ import qs.Ui
 
 BarWidget {
   id: root
-  moduleName: "peter.router"
-  property string version: "1.2.1"
+  moduleName: "petealeon.router"
+  property string version: "1.3.0"
 
   // Watcher health, surfaced to Panel.qml through the injected hostWidget
   // reference. A crashed watcher loses rule re-assertion silently, so the
   // Process below self-heals (bounded) and these properties drive the panel's
-  // health dot.
+  // on/off switch.
+  // `watchEnabled` is the user's intent: when false the watcher is stopped and
+  // nothing re-arms it, so apps fall through to the system default routing.
+  // `watchAlive` is the observed state; the panel's switch reflects the
+  // conjunction so a watcher that died (crash budget exhausted, still enabled)
+  // reads as `off`.
+  property bool watchEnabled: true
   property int watchRestarts: 0
   property int watchPid: 0
   property bool watchAlive: false
@@ -22,10 +28,11 @@ BarWidget {
   property int _lastExit: 0
 
   function logEvent(msg) {
-    console.log("[peter.router] " + msg)
+    console.log("[petealeon.router] " + msg)
   }
 
   function restartWatcher() {
+    root.watchEnabled = true
     root.watchRestarts = 0
     root.watchDead = false
     root._flockRetries = 0
@@ -33,6 +40,35 @@ BarWidget {
     root._stopping = true
     watchProc.running = false
     watchProc.running = true
+  }
+
+  // Master routing switch. Off stops the watcher for good — no re-arm, no
+  // crash restarts — leaving current sink assignments in place and letting new
+  // streams use the system default. On resumes rule re-assertion, resetting
+  // any crash-restart budget a dead watcher may have exhausted.
+  function setWatchEnabled(on) {
+    root.watchEnabled = on
+    if (on) {
+      root.watchRestarts = 0
+      root.watchDead = false
+      root._flockRetries = 0
+      root.logEvent("watcher enabled by user")
+      root._stopping = true
+      watchProc.running = false
+      watchProc.running = true
+    } else {
+      root.watchAlive = false
+      root.logEvent("watcher disabled by user")
+      root._stopping = true
+      watchProc.running = false
+      // "Routing off" must mean "everything back on the system default",
+      // not just "stop re-asserting": streams already moved onto a pinned
+      // output would otherwise stay there indefinitely. The helper's `restore`
+      // flocks the watch lock (so the dying watcher cannot re-assert mid-move)
+      // and puts every valid stream back on `pactl get-default-sink`. Saved
+      // rules are untouched, so switching back on re-pins the same apps.
+      Quickshell.execDetached(["python3", root.helperPath(), "restore"])
+    }
   }
 
   function injectPanel() {
@@ -135,6 +171,7 @@ BarWidget {
   // 200ms de-dup window covers the double-firing case since consecutive
   // watcher exits are always seconds apart.
   function _processExit(reason, code) {
+    if (!root.watchEnabled) return
     if (root._stopping) {
       root._stopping = false
       return
@@ -186,7 +223,7 @@ BarWidget {
     interval: 3000
     running: false
     onTriggered: {
-      if (root.watchDead) return
+      if (root.watchDead || !root.watchEnabled) return
       root._stopping = true
       watchProc.running = false
       watchProc.running = true
@@ -212,7 +249,7 @@ BarWidget {
     interval: 30000
     running: false
     onTriggered: {
-      if (root.watchDead || root.watchAlive) return
+      if (root.watchDead || root.watchAlive || !root.watchEnabled) return
       root.logEvent("watcher re-arming after intentional stop")
       root._stopping = true
       watchProc.running = false
@@ -228,7 +265,7 @@ BarWidget {
     running: true
     repeat: true
     onTriggered: {
-      if (root.watchAlive || root.watchDead || root._stopping) return
+      if (root.watchAlive || root.watchDead || root._stopping || !root.watchEnabled) return
       if (watchRetry.running || watchRearm.running) return
       root.logEvent("watcher liveness check: nothing running, re-arming")
       root._stopping = true
@@ -274,6 +311,7 @@ BarWidget {
     text: panelLoader.item ? panelLoader.item.label : ""
     slotSize: Style.bar.statusSlot
     tooltipText: ""
+    opacity: root.watchEnabled ? 1.0 : 0.6
 
     onPressed: function(b) {
       if (!root.bar) return

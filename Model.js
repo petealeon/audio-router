@@ -1,4 +1,4 @@
-// peter.router data helpers.
+// petealeon.router data helpers.
 //
 // Contract with assets/omarchy-router list:
 //   { sinks:[{index,name,desc,available}], defaultSink, sinkInputs:[{id,appName,binary,nodeName,sink,sinkName}],

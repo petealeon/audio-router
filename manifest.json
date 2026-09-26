@@ -1,9 +1,9 @@
 {
   "schemaVersion": 1,
-  "id": "peter.router",
+  "id": "petealeon.router",
   "name": "Audio Router",
-  "version": "1.2.1",
-  "author": "peter",
+  "version": "1.3.0",
+  "author": "petealeon",
   "description": "Persistent per-app audio routing: link any app to any output from a dedicated two-column patchbay widget",
   "kinds": [
     "bar-widget"

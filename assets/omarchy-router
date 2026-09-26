@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""peter.router helper.
+"""petealeon.router helper.
 
 Subcommands:
   list                       emit the full routing state as one JSON line on stdout
@@ -54,7 +54,7 @@ LOG = f"{RUNTIME}/omarchy-router.watch.log"
 # arrives as 9, not 137), so 143 is deliberately absent.
 INTENTIONAL_EXITS = (0, 3, 15)
 
-EXCLUDE_APPS = {"EasyEffects", "Quickshell"}
+EXCLUDE_APPS = {"EasyEffects", "Quickshell", "wireplumber", "pipewire", "systemd", "pactl", "pw-dump", "xdg-desktop-portal", "xdg-desktop-portal-hyprland"}
 
 RE_APP = re.compile(r'^application\.name\s*=\s*"(.*)"')
 RE_BIN = re.compile(r'^application\.process\.binary\s*=\s*"(.*)"')
@@ -413,20 +413,71 @@ def replace_rule(rules, app, binary, node, sink):
     return kept
 
 
-def cmd_set(app, binary, node, sink_name):
+def cmd_restore():
+    # Restore all valid sink inputs to the system default sink, without touching
+    # the stored rules. Flock the watch lock (bounded) so the watcher cannot
+    # concurrently re-assert pins while we're moving streams.
+    parent = os.getppid()
+    try:
+        mark = open(WATCH_MARK, "w")
+    except OSError:
+        mark = None
+    try:
+        if mark is not None:
+            for _ in range(10):
+                try:
+                    fcntl.flock(mark, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    time.sleep(0.2)
+            else:
+                say_exit("restore: could not acquire watch lock", "flock")
+                sys.exit(3)
+        sinks = parse_sinks(run(["pactl", "list", "sinks"]))
+        sink_by_index = {s["index"]: s for s in sinks}
+        inputs = [e for e in parse_inputs(run(["pactl", "list", "sink-inputs"]), sink_by_index) if is_valid_input(e)]
+        default = run(["pactl", "get-default-sink"]).strip() or ""
+        moved = 0
+        if default:
+            for e in inputs:
+                if e["sinkName"] == default:
+                    continue
+                move(e["id"], default)
+                moved += 1
+        say(f"restore: moved {moved} to default")
+    finally:
+        if mark is not None:
+            try:
+                fcntl.flock(mark, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            mark.close()
+
+
+def cmd_set(app, binary, node, sink_name, move=True):
     app = app or ""
     node = node or ""
     key = key_of_r({"app": app, "binary": binary, "node": node})
     target = "__default__" if (not sink_name or sink_name == "__default__") else sink_name
-    say(f"set-sink key={key!r} app={app!r} binary={binary!r} node={node!r} sink={target}")
+    verb = "moved" if move else "stored"
+    say(f"set-sink {verb} key={key!r} app={app!r} binary={binary!r} node={node!r} sink={target}")
 
     modify_store(lambda rules: replace_rule(rules, app, binary, node, target))
+    if not move:
+        # Routing is off: the rule is kept for the next switch-on, but no
+        # stream is touched now.
+        return
     actual = target if target != "__default__" else run(["pactl", "get-default-sink"]).strip()
     move_matching(app, binary, node, actual)
 
 
+def cmd_set_rule(app, binary, node, sink_name):
+    cmd_set(app, binary, node, sink_name, move=False)
+
+
 def cmd_remove(app_or_binary):
     cmd_set(app_or_binary, "", "", "__default__")
+
 
 
 def move_matching(app, binary, node, target):
@@ -570,6 +621,10 @@ def selftest():
     """
     checks = []
 
+    # Swapped out (and restored in a finally) for the set-rule store/move
+    # separation checks further down.
+    global modify_store, move_matching, run
+
     def check(name, got, want):
         ok = got == want
         checks.append((name, ok))
@@ -643,6 +698,44 @@ def selftest():
     check("intentional exit contract",
           all(code in INTENTIONAL_EXITS for code in (0, 3, 15)) and
           9 not in INTENTIONAL_EXITS and 143 not in INTENTIONAL_EXITS, True)
+    # restore decision: streams not on default should be moved
+    inputs2 = [i for i in inputs if is_valid_input(i)]
+    needs_restore = sum(1 for e in inputs2 if e["sinkName"] != dflt)
+    check("restore: count off-default", needs_restore, 2)
+
+    # set-rule (routing off) must persist the rule and touch no stream, while
+    # set-sink keeps moving. Stub the three I/O seams so this stays zero-I/O.
+    real_modify_store, real_move_matching, real_run = modify_store, move_matching, run
+    box = {"rules": None, "moves": [], "runs": []}
+    try:
+        def fake_modify_store(mutator):
+            box["rules"] = mutator(list(boot))
+
+        def fake_move_matching(app, binary, node, target):
+            box["moves"].append((app, binary, node, target))
+
+        def fake_run(cmd, timeout=4):
+            box["runs"].append(cmd)
+            return dflt + "\n"
+
+        modify_store, move_matching, run = fake_modify_store, fake_move_matching, fake_run
+
+        cmd_set_rule("mpv", "", "mpv", target)
+        stored = {key_of_r(r): r for r in box["rules"]}
+        check("set-rule: rules persisted", sorted(stored), ["mpv", "signal-desktop"])
+        check("set-rule: sink persisted", stored["mpv"]["sink"], target)
+        check("set-rule: no stream moved", box["moves"], [])
+        check("set-rule: no pactl call", box["runs"], [])
+
+        cmd_set("mpv", "", "mpv", target)
+        check("set-sink: stream moved", box["moves"], [("mpv", "", "mpv", target)])
+
+        box["moves"].clear()
+        cmd_set("mpv", "", "mpv", "__default__")
+        check("set-sink __default__: resolves default", box["moves"], [("mpv", "", "mpv", dflt)])
+        check("set-sink __default__: asked pactl", box["runs"][0], ["pactl", "get-default-sink"])
+    finally:
+        modify_store, move_matching, run = real_modify_store, real_move_matching, real_run
 
     failed = [name for name, ok in checks if not ok]
     print(f"selftest: {len(checks) - len(failed)}/{len(checks)} passed")
@@ -652,15 +745,21 @@ def selftest():
 def main():
     args = sys.argv[1:]
     if not args:
-        say("usage: omarchy-router list | set-sink <app> <binary> <sink|__default__> | remove <app-or-binary> | watch | selftest")
+        say("usage: omarchy-router list | set-sink <app> <binary> <node> <sink|__default__>"
+            " | set-rule <app> <binary> <node> <sink|__default__>"
+            " | remove <app-or-binary> | restore | watch | selftest")
         sys.exit(2)
     cmd, rest = args[0], args[1:]
     if cmd == "list":
         cmd_list()
     elif cmd == "set-sink" and len(rest) >= 4:
         cmd_set(rest[0], rest[1], rest[2], rest[3])
+    elif cmd == "set-rule" and len(rest) >= 4:
+        cmd_set_rule(rest[0], rest[1], rest[2], rest[3])
     elif cmd == "remove" and rest:
         cmd_remove(rest[0])
+    elif cmd == "restore":
+        cmd_restore()
     elif cmd == "watch":
         cmd_watch()
     elif cmd == "selftest":

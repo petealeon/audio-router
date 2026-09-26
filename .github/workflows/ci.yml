@@ -20,10 +20,14 @@ jobs:
       - name: Manifest integrity
         run: python3 scripts/check-manifest.py
 
-      - name: QML lint (when qmllint is available)
+      - name: QML lint
         run: |
-          if command -v qmllint >/dev/null 2>&1; then
-            qmllint BarWidget.qml Panel.qml Model.js
-          else
-            echo "skip: qmllint not installed"
-          fi
+          # qmllint lives in the Qt6 tree rather than on PATH: qt6-declarative
+          # on Arch, qt6-declarative-dev-tools on Debian/Ubuntu. The script
+          # finds it, builds the qs.* import shim when an omarchy shell is
+          # present, and fails only on parse errors (qmllint exits 0 for
+          # warnings). Without the shell the qs.* types cannot resolve here, so
+          # this run is a syntax check.
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qt6-declarative-dev-tools
+          ./scripts/qml-lint.sh

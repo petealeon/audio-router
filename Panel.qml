@@ -1,5 +1,4 @@
 import QtQuick
-import QtQuick.Controls
 import Quickshell
 import Quickshell.Io
 import qs.Commons
@@ -8,8 +7,8 @@ import "Model.js" as Model
 
 Panel {
   id: root
-  moduleName: "peter.router"
-  ipcTarget: "peter.router"
+  moduleName: "petealeon.router"
+  ipcTarget: "petealeon.router"
   manageIpc: false
 
   property var anchorItem: null
@@ -70,12 +69,12 @@ Panel {
   property string stateSignature: ""
   property bool stateLoaded: false
   // Set when the helper's `list` read of pactl is degraded (missing sinks or
-  // streams); shown on the status line and in the health tooltip.
+  // streams). Surfaced as a small amber note under the header — the panel
+  // cannot route while pactl is unreadable, and saying so beats silence.
   property string stateError: ""
 
   property var appRows: []
   property var outputRows: []
-  property var pendingApps: []
   property int pinnedCount: 0
   property string _appRowsSig: ""
   property string _outRowsSig: ""
@@ -85,13 +84,20 @@ Panel {
   property string accent: Color.accent
   readonly property color textColor: root.bar ? root.bar.foreground : Color.popups.text
 
+  // Effective watcher state as seen by the header's on/off switch: `on` only
+  // when the watcher is both enabled by intent and actually alive. A watcher
+  // that died (crash budget exhausted) therefore reads as off, and toggling it
+  // back on resets the budget.
+  readonly property bool routingOn: root.hostWidget ? (root.hostWidget.watchEnabled && root.hostWidget.watchAlive) : false
+  readonly property string toggleHint: root.routingOn ? "Turn routing off" : "Turn routing on"
+
   // Omarchy theme roles: accent = "your routes" highlight, foreground =
   // system routes (neutral). Both re-evaluate live when the theme swaps.
   readonly property color userRouteColor: Color.accent
   readonly property color standardRouteColor: Color.foreground
 
   function lineColor(style) {
-    if (style === "pinned" || style === "ghost" || style === "pending") return root.userRouteColor
+    if (style === "pinned" || style === "ghost" || style === "pending" || style === "stored") return root.userRouteColor
     return root.standardRouteColor
   }
   readonly property int rowH: Style.spacing.popupRowHeight
@@ -102,34 +108,11 @@ Panel {
   readonly property int outDotX: Style.space(48)
   readonly property int appGutter: Style.space(48)
   readonly property int connectorLever: Style.space(30)
-  readonly property int headerActionsWidth: Style.space(28)
-  readonly property int watchStatusWidth: Style.space(84)
+  // Gutter reserved left of every source label for the "is outputting" speaker
+  // glyph. Reserved on every row (not only the ones with a stream) so the
+  // labels stay in a single aligned column.
+  readonly property int speakerGutter: Style.space(18)
 
-  function watchColor() {
-    if (root.stateError) return Qt.rgba(0.72, 0.55, 0.2, 1)
-    if (!root.hostWidget) return root.textColor
-    if (root.hostWidget.watchDead) return Qt.rgba(0.88, 0.2, 0.2, 1)
-    if (!root.hostWidget.watchAlive) return Qt.rgba(0.45, 0.48, 0.55, 1)
-    if (root.hostWidget.watchRestarts > 0) return Qt.rgba(0.9, 0.66, 0.24, 1)
-    return Qt.rgba(0.34, 0.78, 0.42, 1)
-  }
-
-  function watchStatusText() {
-    if (root.stateError) return "no pactl"
-    if (!root.hostWidget) return "watch"
-    if (root.hostWidget.watchDead) return "dead"
-    if (!root.hostWidget.watchAlive) return "stopped"
-    if (root.hostWidget.watchRestarts > 0) return "restart " + root.hostWidget.watchRestarts
-    return "alive"
-  }
-
-  function watchTooltip() {
-    var v = (root.hostWidget && root.hostWidget.version) ? root.hostWidget.version : "?"
-    var pid = (root.hostWidget && root.hostWidget.watchPid) ? root.hostWidget.watchPid : 0
-    var s = "peter.router v" + v + " · watcher " + root.watchStatusText() + (pid ? " (pid " + pid + ")" : "") + "\nclick to restart"
-    if (root.stateError) s += "\n" + root.stateError
-    return s
-  }
   readonly property var systemBinaries: {
     var s = {}
     var list = ["pipewire", "wireplumber", "pactl", "python3", "pw-dump", "xdg-desktop-portal", "xdg-desktop-portal-hyprland", "quickshell", "easyeffects", "systemd"]
@@ -137,7 +120,7 @@ Panel {
     return s
   }
 
-  readonly property bool busy: root.dragging || root.showAddPicker
+  readonly property bool busy: root.dragging
 
   // interaction
   property string dragKey: ""
@@ -148,10 +131,24 @@ Panel {
   property real ghostY: 0
   property string hoverAppKey: ""
   property string hoverTarget: ""
+
+  // Keyboard cursor. appCol and outCol share a row grid (same rowStep, same
+  // y origin), so cursorRow is literally the same screen row in either column.
+  // "header" is a virtual section above row 0 holding the routing switch.
+  // The cursor is keyed rather than purely indexed because rows come and go
+  // under it: buildRows() re-sorts appRows whenever a stream appears, stops
+  // or changes device, and the 1s refresh timer runs that even while the user
+  // is navigating.
+  property bool cursorActive: false
+  property string cursorSection: "header"
+  property int cursorRow: 0
+  property string appCursorKey: ""
+  property string outCursorKey: ""
+  readonly property bool headerHasCursor: root.cursorActive && root.cursorSection === "header"
+  readonly property int cursorRowCount: Math.max(root.appRows.length, root.outputRows.length)
   property var _clientCount: {}
   property bool _hadInputs: false
   property int _emptyStreak: 0
-  property bool showAddPicker: false
 
   property var lineSpecs: []
   property var ghostFrom: null
@@ -181,11 +178,24 @@ Panel {
   onOpenedChanged: {
     if (root.opened) {
       root.selectKey = ""
-      root.showAddPicker = false
+      root.resetCursor()
       root.requestState()
     } else {
       root.resetDrag()
     }
+  }
+
+  // appRows/outputRows are only reassigned when their signature changes, so
+  // this is the exact moment the cursor's row indices can go stale.
+  onAppRowsChanged: root.clampCursor()
+  onOutputRowsChanged: root.clampCursor()
+
+  // Stored rules change appearance with the switch: dashed/dim while off,
+  // solid pins once routing is live again.
+  onRoutingOnChanged: {
+    if (!root.opened) return
+    root.buildRows()
+    Qt.callLater(root.rebuildPatch)
   }
 
   function requestState() {
@@ -343,18 +353,6 @@ Panel {
       }
     }
 
-    for (i = 0; i < root.pendingApps.length; ++i) {
-      var p = root.pendingApps[i]
-      var pk = Model.appKey({ binary: p.binary, appName: p.appName })
-      if (rowsMap[pk]) {
-        rowsMap[pk].isPending = true
-      } else {
-        var pendRow = { key: pk, label: p.appName || p.binary || pk, binary: p.binary || "", appName: p.appName || "", streams: [], rule: null, isPending: true, idle: true }
-        rowsMap[pk] = pendRow
-        order.push(pendRow)
-      }
-    }
-
     for (i = 0; i < root.pendingWrites.length; ++i) {
       var pw = root.pendingWrites[i]
       if (!pw.sink || pw.sink === "__default__") {
@@ -448,7 +446,9 @@ Panel {
     var list = []
     var pin = (row.rule && row.rule.sink && row.rule.sink !== "__default__") ? row.rule.sink : ""
     if (pin !== "") {
-      list.push({ name: pin, style: "pinned" })
+      // While routing is off the rule is stored but not in effect, so it draws
+      // as a dashed "stored" line rather than a live pin.
+      list.push({ name: pin, style: root.routingOn ? "pinned" : "stored" })
       return list
     }
     if (row.isPending) {
@@ -465,6 +465,197 @@ Panel {
     }
     list.push({ name: root.defaultSinkName, style: "default" })
     return list
+  }
+
+  // ------------------------------------------------------------ keyboard cursor
+
+  function resetCursor() {
+    root.cursorActive = false
+    root.cursorSection = "header"
+    root.cursorRow = 0
+    root.appCursorKey = root.appRows.length > 0 ? root.appRows[0].key : ""
+    root.outCursorKey = root.outputRows.length > 0 ? root.outputRows[0].key : ""
+  }
+
+  // The app the outputs column is targeting. Entering the outputs column from
+  // an app row sets this, so Return/x/1-9 always have a subject even when the
+  // cursor is parked on the output side.
+  function currentAppRow() {
+    if (root.appRows.length === 0) return null
+    // Inside the apps column the cursor row is the source of truth, and
+    // appCursorKey is updated to follow it. appCursorKey only takes over as the
+    // remembered subject once the cursor has crossed into the outputs column,
+    // where cursorRow indexes outputs instead of apps.
+    if (root.cursorSection === "apps") {
+      var active = root.appRows[Math.min(root.cursorRow, root.appRows.length - 1)]
+      if (active) root.appCursorKey = active.key
+      return active
+    }
+    if (root.appCursorKey !== "") {
+      var r = root.rowForKey(root.appCursorKey)
+      if (r) return r
+    }
+    root.appCursorKey = root.appRows[0].key
+    return root.rowForKey(root.appCursorKey)
+  }
+
+  function currentOutputKey() {
+    if (root.outputRows.length === 0) return ""
+    // Mirror of currentAppRow: the row is authoritative while the cursor is in
+    // the outputs column, outCursorKey only remembers it afterwards.
+    if (root.cursorSection === "outputs") {
+      var active = root.outputRows[Math.min(root.cursorRow, root.outputRows.length - 1)]
+      if (active) root.outCursorKey = active.key
+      return root.outCursorKey
+    }
+    if (root.outCursorKey !== "" && root.outputIndexFor(root.outCursorKey) >= 0) return root.outCursorKey
+    root.outCursorKey = root.outputRows[0].key
+    return root.outCursorKey
+  }
+
+  // Keep the cursor on the same subject across a rebuild: re-resolve the
+  // remembered keys to fresh indices, and fall back to a clamp only when the
+  // subject is genuinely gone. cursorRow has to follow the re-resolved key of
+  // whichever column is active, or the highlight and the row would disagree.
+  function clampCursor() {
+    if (root.outputRows.length === 0) {
+      root.outCursorKey = ""
+    } else {
+      var oi = root.outputIndexFor(root.outCursorKey)
+      oi = oi >= 0 ? oi : 0
+      root.outCursorKey = root.outputRows[oi].key
+      if (root.cursorSection === "outputs") root.cursorRow = oi
+    }
+    if (root.appRows.length === 0) {
+      root.appCursorKey = ""
+    } else {
+      var ai = root.rowIndexForKey(root.appCursorKey)
+      ai = ai >= 0 ? ai : 0
+      root.appCursorKey = root.appRows[ai].key
+      if (root.cursorSection === "apps") root.cursorRow = ai
+    }
+    if (root.cursorSection === "header") return
+    var max = root.cursorRowCount - 1
+    root.cursorRow = Math.max(0, Math.min(root.cursorRow, max))
+  }
+
+  function moveCursor(delta) {
+    if (root.cursorSection === "header") {
+      if (delta > 0 && root.cursorRowCount > 0) {
+        root.cursorSection = "apps"
+        root.syncCursorRow()
+      }
+      return
+    }
+    if (delta < 0 && root.cursorRow === 0) {
+      root.cursorSection = "header"
+      return
+    }
+    root.cursorRow = Math.max(0, Math.min(root.cursorRow + delta, root.cursorRowCount - 1))
+    root.syncCursorRow()
+  }
+
+  function moveCursorH(delta) {
+    if (root.cursorSection === "header") return
+    if (delta > 0) {
+      if (root.cursorSection === "apps") {
+        var row = root.currentAppRow()
+        if (!row) return
+        root.appCursorKey = row.key
+        // Start on the output this app is actually on, so Right lands on
+        // something meaningful rather than an arbitrary row.
+        var targets = root.targetsFor(row)
+        var want = targets.length > 0 ? targets[0].name : root.defaultSinkName
+        var oi = root.outputIndexFor(want)
+        root.cursorRow = oi >= 0 ? oi : root.cursorRow
+        // Switch columns before syncing: the resolvers read cursorRow against
+        // the column they are in, so the new row has to be resolved as an
+        // output, not as the app row it was borrowed from.
+        root.cursorSection = "outputs"
+        root.syncCursorRow()
+      }
+      return
+    }
+    if (root.cursorSection === "outputs") {
+      root.cursorSection = "apps"
+      var ai = root.rowIndexForKey(root.appCursorKey)
+      if (ai >= 0) root.cursorRow = ai
+      root.syncCursorRow()
+    }
+  }
+
+  // Push the active section's subject into the shared hover properties, which
+  // is what the row highlights and the canvas already read. No cursor-specific
+  // rendering needed, and mouse hover stays the same visual language.
+  function syncCursorRow() {
+    if (root.cursorSection === "outputs") {
+      var ok = root.currentOutputKey()
+      root.hoverTarget = root.cursorActive ? ok : ""
+      root.hoverAppKey = ""
+      return
+    }
+    var key = ""
+    if (root.cursorSection === "apps" && root.cursorActive) {
+      var row = root.currentAppRow()
+      if (row) key = row.key
+    }
+    root.hoverAppKey = key
+    root.hoverTarget = ""
+  }
+
+  function setHeaderCursor() {
+    root.cursorActive = true
+    root.cursorSection = "header"
+    root.hoverAppKey = ""
+    root.hoverTarget = ""
+  }
+
+  function toggleRoutingFromCursor() {
+    if (root.hostWidget && root.hostWidget.setWatchEnabled)
+      root.hostWidget.setWatchEnabled(!root.routingOn)
+  }
+
+  function activateCursor() {
+    if (root.cursorSection === "header") {
+      root.toggleRoutingFromCursor()
+      return
+    }
+    var row = root.currentAppRow()
+    var out = root.currentOutputKey()
+    if (!row || !out) return
+    root.commitLink(row.key, out)
+  }
+
+  function deleteCursor() {
+    var row = root.currentAppRow()
+    if (!row) return
+    root.unpinKey(row.key)
+  }
+
+  function quickRouteCursor(digit) {
+    var n = parseInt(digit, 10)
+    if (!(n >= 1 && n <= 9)) return
+    if (root.outputRows.length < n) return
+    var row = root.currentAppRow()
+    if (!row) return
+    root.commitLink(row.key, root.outputRows[n - 1].key)
+  }
+
+  // The built-in panels keep the focused row inside the viewport; without this
+  // j/k can walk the cursor off-screen. There is no ListView here, so do it
+  // against the Flickable directly.
+  function ensureCursorVisible() {
+    if (!routerScroll) return
+    var maxY = Math.max(0, routerScroll.contentHeight - routerScroll.height)
+    if (maxY <= 0) return
+    var top = root.cursorRow * root.rowStep
+    var bottom = top + root.rowH
+    var margin = Style.space(6)
+    if (root.cursorSection === "header" || top < routerScroll.contentY + margin) {
+      routerScroll.contentY = Math.max(0, Math.min(maxY, top - margin))
+    } else if (bottom > routerScroll.contentY + routerScroll.height - margin) {
+      routerScroll.contentY = Math.max(0, Math.min(maxY, bottom + margin - routerScroll.height))
+    }
   }
 
   // ------------------------------------------------------------- interaction
@@ -551,7 +742,7 @@ Panel {
   }
 
   function rowKeyAt(x, y) {
-    if (root.showAddPicker || appRepeater.count === 0) return ""
+    if (appRepeater.count === 0) return ""
     if (y < 0 || y >= appRepeater.count * root.rowStep) return ""
     if (x < 0 || x > appCol.width) return ""
     var idx = Math.floor(y / root.rowStep)
@@ -570,24 +761,16 @@ Panel {
     return key
   }
 
-  function pickerAt(x, y) {
-    if (!root.showAddPicker || pickerRepeater.count === 0) return -1
-    if (x < 0 || x > appCol.width) return -1
-    var yRow = y - Style.space(16)
-    if (yRow < 0 || yRow >= pickerRepeater.count * root.rowStep) return -1
-    return Math.floor(yRow / root.rowStep)
-  }
-
   function commitLink(key, outName) {
     var row = root.rowForKey(key)
     root.selectKey = ""
-    root.showAddPicker = false
     if (!row) return
     var sinkArg = (outName === "__default__") ? "__default__" : outName
-    root.logEvent("link key=" + key + " app=" + (row.appName || "") + " bin=" + (row.binary || "") + " target=" + (sinkArg === "__default__" ? "_default_" : sinkArg))
-    root.pendingApps = root.pendingApps.filter(function(p) {
-      return Model.appKey({ binary: p.binary, appName: p.appName }) !== key
-    })
+    // Routing off: persist the rule but leave the stream alone — the watcher
+    // applies it on the next switch-on. A reset still moves, because "every
+    // stream is already on the default" is exactly what off means.
+    var storeOnly = !root.routingOn && sinkArg !== "__default__"
+    root.logEvent("link " + (storeOnly ? "store-only " : "") + "key=" + key + " app=" + (row.appName || "") + " bin=" + (row.binary || "") + " target=" + (sinkArg === "__default__" ? "_default_" : sinkArg))
     root.pendingWrites = root.pendingWrites.filter(function(w) {
       return Model.ruleKey(w) !== key
     })
@@ -602,7 +785,7 @@ Panel {
     }
     root.buildRows()
     Qt.callLater(root.rebuildPatch)
-    Quickshell.execDetached(["python3", root.helperPath(), "set-sink", row.appName || "", row.binary || "", row.nodeName || "", sinkArg])
+    Quickshell.execDetached(["python3", root.helperPath(), storeOnly ? "set-rule" : "set-sink", row.appName || "", row.binary || "", row.nodeName || "", sinkArg])
     root.refreshAfterCommit()
   }
 
@@ -621,7 +804,6 @@ Panel {
       ts: Date.now()
     })
     root.selectKey = ""
-    root.showAddPicker = false
     root.buildRows()
     Qt.callLater(root.rebuildPatch)
     Quickshell.execDetached(["python3", root.helperPath(), "set-sink", row.appName || "", row.binary || "", row.nodeName || "", "__default__"])
@@ -629,7 +811,7 @@ Panel {
   }
 
   function logEvent(msg) {
-    console.log("[peter.router] " + msg)
+    console.log("[petealeon.router] " + msg)
   }
 
   function refreshAfterCommit() {
@@ -644,34 +826,6 @@ Panel {
       root.requestState()
       root.prunePendingWrites()
     }
-  }
-
-  function pendingAdd(appName, binary) {
-    root.pendingApps.push({ appName: appName, binary: binary || "" })
-    root.showAddPicker = false
-    root.buildRows()
-    Qt.callLater(root.rebuildPatch)
-  }
-
-  function toggleAddPicker() {
-    root.showAddPicker = !root.showAddPicker
-    if (root.showAddPicker) root.selectKey = ""
-  }
-
-  readonly property var candidates: {
-    if (!root.stateLoaded) return []
-    var keys = {}
-    var i
-    for (i = 0; i < root.appRows.length; ++i) keys[root.appRows[i].key] = 1
-    var out = []
-    for (i = 0; i < root.clients.length; ++i) {
-      var c = root.clients[i]
-      var cleaned = Model.stripInput(c.appName)
-      var k = Model.appKey({ binary: c.binary, appName: cleaned })
-      if (keys[k]) continue
-      out.push({ appName: cleaned, binary: c.binary })
-    }
-    return out
   }
 
   // ------------------------------------------------------------- patch lines
@@ -729,6 +883,13 @@ Panel {
       w = 1.6
       a = 0.6
       endpoint = true
+    } else if (l.style === "stored") {
+      // Saved but not in effect (routing is off). Dashed, dim, and with no
+      // endpoint dot — a solid line with a dot here would claim the stream is
+      // actually sitting on that output.
+      w = 1.6
+      a = 0.5
+      dash = [3, 4]
     } else if (l.style === "live") {
       w = 1.4
       a = 0.85
@@ -780,11 +941,34 @@ Panel {
       anchors.fill: parent
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
-      onReturnRequested: root.toggleAddPicker()
       onMoveRequested: function(dx, dy) {
-        if (dy !== 0) {
-          routerScroll.contentY = Math.max(0, Math.min(routerScroll.contentHeight - routerScroll.height,
-            routerScroll.contentY + dy * Style.space(40)))
+        // First arrow only wakes the cursor: it must not also move or scroll,
+        // or the panel jumps the moment it opens under a stray keypress.
+        if (!root.cursorActive) {
+          root.cursorActive = true
+          root.syncCursorRow()
+          root.ensureCursorVisible()
+          return
+        }
+        if (dy !== 0) root.moveCursor(dy)
+        else if (dx !== 0) root.moveCursorH(dx)
+        root.syncCursorRow()
+        root.ensureCursorVisible()
+      }
+      onActivateRequested: {
+        if (!root.cursorActive) { root.cursorActive = true; root.syncCursorRow(); return }
+        root.activateCursor()
+      }
+      onDeleteRequested: {
+        if (!root.cursorActive) return
+        root.deleteCursor()
+        root.syncCursorRow()
+      }
+      onTextKey: function(t) {
+        if (t >= "1" && t <= "9") {
+          if (!root.cursorActive) { root.cursorActive = true; root.syncCursorRow() }
+          root.quickRouteCursor(t)
+          root.syncCursorRow()
         }
       }
     }
@@ -803,102 +987,75 @@ Panel {
         width: routerScroll.width
         spacing: Style.spacing.controlGap
 
-      Row {
-        id: header
+      PanelHero {
+        id: hero
         width: parent.width
-        spacing: Style.spacing.controlGap
-
-        Text {
-          width: parent.width - root.headerActionsWidth - root.watchStatusWidth
-          anchors.verticalCenter: parent.verticalCenter
-          elide: Text.ElideRight
-          font.pixelSize: Style.font.title
-          color: root.textColor
-          text: "Audio routes"
-        }
-
-        Item {
-          id: watchStatus
-          width: root.watchStatusWidth
-          height: root.rowH
-          property bool watchHovered: false
-
-          Rectangle {
-            id: statusDot
-            anchors.right: parent.right
-            anchors.verticalCenter: parent.verticalCenter
-            width: Style.space(7)
-            height: Style.space(7)
-            radius: Style.space(3.5)
-            color: root.watchColor()
-          }
-
+        title: "Audio Router"
+        meta: "drag app → output\nclick the ring to unlink"
+        foreground: root.textColor
+        fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+        iconOpacity: root.routingOn ? 1.0 : 0.5
+        iconComponent: Component {
           Text {
-            anchors.right: statusDot.left
-            anchors.rightMargin: Style.space(5)
-            anchors.verticalCenter: parent.verticalCenter
-            font.pixelSize: Style.font.caption
+            anchors.centerIn: parent
+            font.family: hero.fontFamily
+            font.pixelSize: Style.font.display
             color: root.textColor
-            opacity: 0.75
-            text: root.watchStatusText()
-
-            MouseArea {
-              anchors.fill: parent
-              acceptedButtons: Qt.NoButton
-              cursorShape: Qt.PointingHandCursor
-            }
+            text: root.label
           }
-
-          MouseArea {
-            id: watchStatusMouse
-            anchors.fill: parent
-            hoverEnabled: true
-            onEntered: watchStatus.watchHovered = true
-            onExited: watchStatus.watchHovered = false
-            onClicked: {
-              if (root.hostWidget && root.hostWidget.restartWatcher) root.hostWidget.restartWatcher()
-            }
-          }
-
-          ToolTip.visible: watchStatus.watchHovered
-          ToolTip.text: root.watchTooltip()
-          ToolTip.delay: 400
         }
 
-        Item {
-          id: headerActions
-          width: Style.space(64)
-          height: root.rowH
+        trailingControl: Component {
+          ToggleSwitch {
+            id: powerSwitch
+            checked: root.routingOn
+            foreground: hero.foreground
+            hasCursor: root.headerHasCursor
+            onHovered: function(on) { if (on) root.setHeaderCursor() }
+            onToggled: {
+              if (root.hostWidget && root.hostWidget.setWatchEnabled)
+                root.hostWidget.setWatchEnabled(!root.routingOn)
+            }
 
-          Text {
-            id: addButton
-            anchors.right: parent.right
-            anchors.verticalCenter: parent.verticalCenter
-            font.pixelSize: Style.font.body
-            color: root.accent
-            visible: root.candidates.length > 0
-            text: root.showAddPicker ? "\u2715" : "+"
-            MouseArea {
-              anchors.fill: parent
-              onClicked: root.toggleAddPicker()
+            PanelToolTip {
+              visible: powerSwitch.containsMouse
+              text: root.toggleHint
+              fontFamily: hero.fontFamily
             }
           }
         }
       }
 
+      // Degraded pactl beats the "routing off" note — an unreadable pactl
+      // means routing cannot work at all, regardless of the switch position.
       Text {
+        id: statusNote
         width: parent.width
+        visible: root.stateError !== "" || !root.routingOn
         font.pixelSize: Style.font.caption
-        color: root.textColor
-        opacity: 0.5
+        font.family: root.bar ? root.bar.fontFamily : Style.font.family
+        color: root.stateError !== "" ? Qt.rgba(0.85, 0.66, 0.24, 1) : root.textColor
+        opacity: root.stateError !== "" ? 1.0 : 0.6
         horizontalAlignment: Text.AlignHCenter
-        text: "drag app → output · click ring to unlink"
+        wrapMode: Text.WordWrap
+        text: root.stateError !== ""
+          ? "routing unavailable — " + root.stateError
+          : "routing off — edits kept, applied when switched on"
+      }
+
+      PanelSeparator {
+        foreground: root.textColor
       }
 
       Item {
         id: patchArea
         width: parent.width
         height: Math.max(root.appRows.length, root.outputRows.length) * root.rowStep
+        // While routing is off, drag/drop still works (edits are kept and
+        // applied when the switch comes back on), but the whole patch is dimmed
+        // so nothing reads as actively routed. The statusNote above carries the
+        // reason.
+        opacity: root.routingOn ? 1.0 : 0.55
 
         Column {
           id: appCol
@@ -907,7 +1064,6 @@ Panel {
           width: parent.width - outCol.width
           spacing: 0
           z: 2
-          visible: !root.showAddPicker
 
           Repeater {
             id: appRepeater
@@ -928,28 +1084,28 @@ Panel {
                     : "transparent"
                 }
 
-                Rectangle {
-                  id: appBox
-                  visible: model.streams.length > 0
-                  x: root.appDotX - Style.space(4)
-                  y: Style.space(2)
-                  width: Math.max(root.minLabelW + Style.space(26), (appDot.x + appDot.width) - x)
-                  height: root.rowStep - Style.space(4)
-                  radius: Style.space(8)
-                  color: Qt.rgba(Color.popups.background.r, Color.popups.background.g, Color.popups.background.b, 0.9)
-                  border.width: 1
-                  border.color: Qt.rgba(Color.popups.border.r, Color.popups.border.g, Color.popups.border.b, 0.3)
-                }
-
                 Item {
                   id: appLine
                   anchors.top: parent.top
                   width: parent.width
                   height: root.rowH
 
+                  // "This source is producing audio right now." Accent when the
+                  // stream is pinned to one of the user's routes, plain
+                  // foreground when it is just on the system default.
+                  Text {
+                    id: appSpeaker
+                    x: root.appDotX
+                    anchors.verticalCenter: parent.verticalCenter
+                    visible: model.streams.length > 0
+                    font.pixelSize: Style.font.caption
+                    color: (model.rule || model.pendingDefault) ? root.userRouteColor : root.textColor
+                    text: "\uF028"
+                  }
+
                   Text {
                     id: appLabel
-                    x: root.appDotX + Style.space(10)
+                    x: root.appDotX + root.speakerGutter
                     anchors.verticalCenter: parent.verticalCenter
                     width: Math.max(root.minLabelW, appCol.width - root.appDotX - root.appGutter - Style.space(16) - (model.streams.length > 1 ? Style.space(18) : 0))
                     elide: Text.ElideRight
@@ -997,49 +1153,6 @@ Panel {
                     }
                   }
                   }
-                }
-              }
-            }
-          }
-        }
-
-        Column {
-          id: pickerCol
-          x: 0
-          y: 0
-          width: parent.width - outCol.width
-          z: 2
-          visible: root.showAddPicker
-          spacing: 0
-
-          Text {
-            width: parent.width
-            height: Style.space(16)
-            elide: Text.ElideRight
-            font.pixelSize: Style.font.caption
-            color: root.textColor
-            opacity: 0.45
-            text: "Not currently playing"
-          }
-
-          Repeater {
-            id: pickerRepeater
-            model: root.candidates
-            delegate: Component {
-              Item {
-                id: pickDlg
-                required property var model
-                width: pickerCol.width
-                height: root.rowStep
-
-                Text {
-                  x: Style.space(8)
-                  anchors.verticalCenter: parent.verticalCenter
-                  width: pickerCol.width - Style.space(16)
-                  elide: Text.ElideRight
-                  font.pixelSize: Style.font.body
-                  color: root.textColor
-                  text: model.appName
                 }
               }
             }
@@ -1165,20 +1278,11 @@ Panel {
           acceptedButtons: Qt.LeftButton
 
           onPositionChanged: (m) => {
-            if (root.showAddPicker) return
             root.hoverAppKey = root.rowKeyAt(m.x, m.y)
             if (root.dragging) root.updateDragAt(m.x, m.y)
           }
 
           onPressed: (m) => {
-            if (root.showAddPicker) {
-              var pi = root.pickerAt(m.x, m.y)
-              if (pi >= 0) {
-                var cand = root.candidates[pi]
-                root.pendingAdd(cand.appName, cand.binary)
-              }
-              return
-            }
             var akey = root.rowKeyAt(m.x, m.y)
             if (akey !== "") {
               var arow = root.rowForKey(akey)

@@ -86,7 +86,11 @@ Watcher log: `$XDG_RUNTIME_DIR/omarchy-router.watch.log`.
   can never spawn a duplicate.
 - **Self-healing:** the widget restarts a crashed watcher (bounded, 3s delay,
   5 attempts per session) and reports state on the health dot. A manual restart
-  resets the counter.
+  resets the counter. Flock conflicts, SIGTERM teardown and clean exits are not
+  counted as crashes: the watcher briefly waits out a stale lock holder on
+  plugin reloads, retries a contended flock once, and otherwise re-arms
+  quietly on a 30s timer — with a liveness backstop should the engine deliver
+  no death event at all.
 - Manual start: `python3 assets/omarchy-router watch`
 
 ## CLI

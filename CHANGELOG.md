@@ -3,6 +3,48 @@
 All notable changes to `peter.router` are documented here. SemVer; releases are
 tagged `vX.Y.Z`.
 
+## [1.2.1] - 2026-09-26
+
+### Fixed
+- **Watcher deaths are never lost and flock conflicts never burn the restart
+  budget.** Quickshell's `Process.onExited` is reliable for signal deaths but
+  drops clean exits (the watcher quitting on a `flock` conflict), which used to
+  leave routes silently dead. The helper now announces every intentional stop
+  via a `__WATCH_EXIT` marker on stderr; the widget dispatches on the first of
+  that marker or `onExited` (de-duplicated), treats `{0, 3, 15}` as intentional
+  stops that are quietly re-armed on a 30s timer, and only counts genuine
+  crash signals (SIGKILL etc.) against the 5-restart-per-session budget. A
+  20s liveness backstop re-arms even if the engine delivers no event at all.
+- **Plugin reloads are quiet.** A reload's new watcher briefly shares the flock
+  with its predecessor winding down; the helper now waits out a stale holder
+  for up to ~2s instead of exiting, so a reload restores a single healthy
+  watcher without contention noise.
+- **Silent rule loss on a corrupt `router-rules.json`.** An unreadable store is
+  now renamed aside to `router-rules.json.corrupt.<ts>` (never silently
+  overwritten) and the problem is surfaced through `list.error` / the health
+  tooltip.
+- **Lost-update on store lock timeout.** `modify_store` now refuses the write
+  when the exclusive lock cannot be acquired (5s) and logs it, instead of
+  performing an unlocked read-modify-write.
+- **Unbounded log growth on repeated poll errors.** Watch-loop diagnostics are
+  rate-limited to one write per 10s per class; `traced`/`missing_reported`
+  caches are capped.
+- **Spurious restart during reload teardown.** `Component.onDestruction` stops
+  the tracked watcher so plugin reloads don't rattle it through a crash path.
+- **Flakey flock-contention recovery.** The "retry once" budget now survives
+  respawns during a contention episode (cleared only after a watcher lives past
+  the startup window), and a brief startup grace guarantees the tracker has
+  observed the child before it may exit.
+
+### Changed
+- `router-rules.json` is written with mode `0600`.
+- `install.sh --remove/--purge` kill is anchored to the plugin's own helper
+  path (no broad substring match).
+- Helper diagnostics (`say()` output, tracebacks) are captured into the widget
+  log via a `StdioCollector` on the watcher process.
+- `selftest` coverage grown to 33 checks (rate-limiter, store-issue merge,
+  intentional-exit contract).
+
 ## [1.2.0] - 2026-09-26
 
 ### Added

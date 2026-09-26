@@ -47,6 +47,13 @@ LOCK = f"{RUNTIME}/omarchy-router.store.lock"
 WATCH_MARK = f"{RUNTIME}/omarchy-router.watch.lock"
 LOG = f"{RUNTIME}/omarchy-router.watch.log"
 
+# Exit codes that mean "intentional stop" rather than a crash. Shared contract
+# with BarWidget.qml onExited: 0 = clean self-exit, 3 = flock conflict or parent
+# gone, 15 = SIGTERM (the engine sends this on running=false and shell/config
+# teardown). Quickshell reports signal deaths by raw signal number (a SIGKILL
+# arrives as 9, not 137), so 143 is deliberately absent.
+INTENTIONAL_EXITS = (0, 3, 15)
+
 EXCLUDE_APPS = {"EasyEffects", "Quickshell"}
 
 RE_APP = re.compile(r'^application\.name\s*=\s*"(.*)"')
@@ -63,6 +70,15 @@ def say(msg):
     sys.stderr.flush()
 
 
+def say_exit(msg, reason):
+    # Human-readable line + lifecycle marker delivered in ONE stderr write so
+    # both always survive process teardown (quickshell's collector has been
+    # observed dropping bytes written in a separate flush immediately before a
+    # clean exit). The marker must come first: the widget dispatches on it.
+    sys.stderr.write(f"__WATCH_EXIT {reason}\nomarchy-router: {msg}\n")
+    sys.stderr.flush()
+
+
 def run(cmd, timeout=4):
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -75,12 +91,33 @@ def basename(p):
     return (p or "").rsplit("/", 1)[-1]
 
 
+# One-line diagnostics about the store, surfaced through `list`'s error field.
+# Mutable container so plain functions can set it without a `global` dance.
+STORE_ISSUE = [""]
+
+
 def load_rules():
+    """Read the rules store. A missing file returns []. A corrupt or
+    wrong-shaped file is never silently overwritten: a corrupt file is first
+    renamed to ``router-rules.json.corrupt.<ts>`` and the problem is recorded
+    in STORE_ISSUE for the panel to show."""
     try:
         with open(STORE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return data if isinstance(data, list) else []
+        if isinstance(data, list):
+            return data
+        STORE_ISSUE[0] = "router-rules.json root is not a list; treated as empty"
+        return []
+    except FileNotFoundError:
+        return []
     except Exception:
+        ts = time.strftime("%Y%m%d%H%M%S")
+        backup = f"{STORE}.corrupt.{ts}"
+        try:
+            os.replace(STORE, backup)
+        except Exception:
+            backup = STORE
+        STORE_ISSUE[0] = f"router-rules.json was unreadable; preserved as {os.path.basename(backup)}"
         return []
 
 
@@ -89,6 +126,7 @@ def write_rules(rules):
     tmp = STORE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(rules, f, indent=2)
+    os.chmod(tmp, 0o600)
     os.replace(tmp, STORE)
 
 
@@ -239,7 +277,7 @@ def match_rule(e, rules):
     return None
 
 
-def acquire_ex(fd, timeout=2.0):
+def acquire_ex(fd, timeout=5.0):
     end = time.monotonic() + timeout
     while True:
         try:
@@ -247,7 +285,7 @@ def acquire_ex(fd, timeout=2.0):
             return True
         except OSError:
             if time.monotonic() >= end:
-                say(f"could not acquire store lock within {timeout}s — proceeding without it")
+                say(f"could not acquire store lock within {timeout}s")
                 return False
             time.sleep(0.02)
 
@@ -266,12 +304,13 @@ def read_store_locked():
 def modify_store(mutator):
     os.makedirs(os.path.dirname(STORE), exist_ok=True)
     with open(LOCK, "w", encoding="utf-8") as fd:
-        acquire_ex(fd)
-        rules = mutator(load_rules())
-        tmp = STORE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(rules, f, indent=2)
-        os.replace(tmp, STORE)
+        if not acquire_ex(fd):
+            # Never perform an unlocked read-modify-write: two concurrent
+            # writers could each drop the other's rule. Skip and surface it.
+            say("store lock unavailable — refusing write")
+            wlog("refused store write: lock unavailable after 5s")
+            return
+        write_rules(mutator(load_rules()))
 
 
 def move(id_, sink_name):
@@ -310,6 +349,21 @@ def effective_sink(target, sinks, default=None):
     return ""
 
 
+def due(last_ts, now, interval):
+    """Pure rate-limit decision: True when `now` is at least `interval`
+    seconds after `last_ts`, or when `last_ts` is None (first occurrence).
+    The caller owns the timestamp."""
+    return last_ts is None or now - last_ts >= interval
+
+
+def merge_issues(issues, store_issue):
+    """Combine pactl diagnostics with the store issue, deduplicated."""
+    out = list(issues)
+    if store_issue and store_issue not in out:
+        out.append(store_issue)
+    return out
+
+
 def describe_issues(sinks_raw, pactl_found):
     """Diagnostics for a degraded pactl read. An empty sink-inputs list is a
     normal idle state, so only the sink read and pactl's presence matter.
@@ -337,7 +391,10 @@ def cmd_list():
         "clients": clients,
         "rules": load_rules(),
     }
-    issues = describe_issues(sinks_raw, shutil.which("pactl") is not None)
+    issues = merge_issues(
+        describe_issues(sinks_raw, shutil.which("pactl") is not None),
+        STORE_ISSUE[0],
+    )
     if issues:
         payload["error"] = "; ".join(issues)
     print(json.dumps(payload))
@@ -391,11 +448,24 @@ def move_matching(app, binary, node, target):
 
 
 def cmd_watch():
+    # Brief startup grace: the engine's Process tracker needs a moment to
+    # observe "running" before the child exits cleanly, otherwise an instant
+    # flock-conflict exit can be lost by the tracker and leave the widget's
+    # process wedged in limbo. 0.4s is well inside the 0.5s poll cadence.
+    time.sleep(0.4)
     mark = open(WATCH_MARK, "w")
-    try:
-        fcntl.flock(mark, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        say("watch: another watcher is already running")
+    # Wait out a stale holder instead of exiting at once: on a plugin reload the
+    # previous watcher legitimately holds the flock for a fraction of a second
+    # while it winds down. A bounded poll lets that overlap resolve cleanly;
+    # only a genuinely live second instance outlasts the window and gets exit 3.
+    for _ in range(10):
+        try:
+            fcntl.flock(mark, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except OSError:
+            time.sleep(0.2)
+    else:
+        say_exit("watch: another watcher is already running", "flock")
         sys.exit(3)
     parent = os.getppid()
     try:
@@ -405,10 +475,11 @@ def cmd_watch():
     say(f"watch: started (parent {parent}, store {STORE})")
     traced = {}
     missing_reported = {}
+    error_last = {}
     while True:
         try:
             if os.getppid() != parent:
-                say("watch: parent is gone — exiting")
+                say_exit("watch: parent is gone — exiting", "parent")
                 sys.exit(3)
             rules = read_store_locked()
             if rules:
@@ -421,7 +492,7 @@ def cmd_watch():
                     if not r or not r.get("sink"):
                         if r is None:
                             tk = norm(basename(e.get("binary", ""))) or norm(basename(e.get("nodeName", ""))) or norm(e.get("appName", ""))
-                            if time.monotonic() - traced.get(tk, 0) > 10:
+                            if (len(traced) < 512 or tk in traced) and time.monotonic() - traced.get(tk, 0) > 10:
                                 traced[tk] = time.monotonic()
                                 wlog(f"no rule match: app={e.get('appName','')!r} bin={e.get('binary','')!r} node={e.get('nodeName','')!r}")
                         continue
@@ -431,7 +502,7 @@ def cmd_watch():
                     if not eff:
                         continue
                     if eff != r["sink"]:
-                        if r["sink"] not in missing_reported:
+                        if r["sink"] not in missing_reported and len(missing_reported) < 128:
                             missing_reported[r["sink"]] = True
                             wlog(f"sink missing ({r['sink']}) -> default ({eff})")
                     else:
@@ -444,7 +515,9 @@ def cmd_watch():
                     wlog(f"rules reasserted ({moved} stream{'s' if moved != 1 else ''})")
         except Exception as ex:
             say(f"watch: poll error: {ex}")
-            wlog(f"poll error: {ex}")
+            if due(error_last.get("poll"), time.monotonic(), 10):
+                error_last["poll"] = time.monotonic()
+                wlog(f"poll error: {ex}")
         time.sleep(0.5)
 
 
@@ -560,6 +633,16 @@ def selftest():
     check("describe_issues no sinks", describe_issues("", True), ["pactl returned no sink data"])
     check("describe_issues pactl missing", describe_issues("Sink #88", False), ["pactl not found"])
     check("describe_issues pactl missing and no sinks", describe_issues("", False), ["pactl not found"])
+
+    check("due first call", due(None, 500.0, 10), True)
+    check("due before window", due(490.0, 495.0, 10), False)
+    check("due at window edge", due(490.0, 500.0, 10), True)
+    check("merge_issues dedupes", merge_issues(["a"], "a"), ["a"])
+    check("merge_issues appends", merge_issues(["a"], "b"), ["a", "b"])
+    check("merge_issues ignores empty", merge_issues(["a"], ""), ["a"])
+    check("intentional exit contract",
+          all(code in INTENTIONAL_EXITS for code in (0, 3, 15)) and
+          9 not in INTENTIONAL_EXITS and 143 not in INTENTIONAL_EXITS, True)
 
     failed = [name for name, ok in checks if not ok]
     print(f"selftest: {len(checks) - len(failed)}/{len(checks)} passed")

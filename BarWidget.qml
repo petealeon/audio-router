@@ -7,7 +7,7 @@ import qs.Ui
 BarWidget {
   id: root
   moduleName: "peter.router"
-  property string version: "1.2.0"
+  property string version: "1.2.1"
 
   // Watcher health, surfaced to Panel.qml through the injected hostWidget
   // reference. A crashed watcher loses rule re-assertion silently, so the
@@ -17,8 +17,9 @@ BarWidget {
   property int watchPid: 0
   property bool watchAlive: false
   property bool watchDead: false
-  property int _suppressExit: 0
+  property bool _stopping: false
   property int _flockRetries: 0
+  property int _lastExit: 0
 
   function logEvent(msg) {
     console.log("[peter.router] " + msg)
@@ -28,8 +29,8 @@ BarWidget {
     root.watchRestarts = 0
     root.watchDead = false
     root._flockRetries = 0
-    root._suppressExit += 1
     root.logEvent("watcher restart requested by user")
+    root._stopping = true
     watchProc.running = false
     watchProc.running = true
   }
@@ -85,49 +86,99 @@ BarWidget {
   // created for an idle app also catches the stream the moment it starts, and
   // any external default-sink switch gets corrected within a second. The
   // helper flocks, so a shell (or plugin) reload can never spawn a second one.
+  // Dispatch on the watcher's own lifecycle announcements. Quickshell only
+  // fires Process.onExited for signal deaths, dropping it for a clean non-zero
+  // exit (e.g. the watcher quitting on a flock conflict) — which used to leave
+  // a wedge: no onExited, no restart, no re-arm, and routes silently dead. The
+  // helper therefore prints a __WATCH_EXIT marker on stderr before every
+  // intentional exit, and the StdioCollector (reliably delivered) dispatches
+  // here. onExited remains as a de-duplicated fallback for signal deaths.
   Process {
     id: watchProc
     running: true
     command: ["python3", root.helperPath(), "watch"]
 
+    stderr: StdioCollector {
+      onStreamFinished: {
+        var msg = String(text || "").trim()
+        if (msg !== "") root.logEvent("watcher: " + msg)
+        var m = /__WATCH_EXIT\s+(\w+)/.exec(msg)
+        root._processExit(m ? m[1] : "", 0)
+      }
+    }
+
     onStarted: {
       root.watchAlive = true
       root.watchPid = watchProc.processId || 0
-      root._flockRetries = 0
+      // The stop half of any restart/respawn is behind us once a child is up;
+      // a late SIGTERM notice from that stop is tolerated downstream (15 is
+      // handled as a quiet no-op when a watcher is already running).
+      root._stopping = false
+      // Do NOT reset _flockRetries here: a flock-contention episode spans
+      // respawns, so the "retry once" budget must survive spawn -> exit -> 3.
+      // watchSurvived clears it once a watcher demonstrably lives past the
+      // startup window.
+      watchSurvived.restart()
       root.logEvent("watcher started pid=" + root.watchPid)
     }
 
     onExited: function(exitCode) {
-      root.watchAlive = false
-      if (root._suppressExit > 0) {
-        // This exit was the stop half of a manual/retry restart; the respawn
-        // is on its way.
-        root._suppressExit -= 1
-        return
-      }
-      if (root.watchDead) return
-      if (exitCode === 3) {
-        // Intentional watcher exit — normally another watcher holding the
-        // flock. That clears within ~0.5s of a shell reload (the old watcher
-        // sees its parent die), so retry once before giving up.
-        if (root._flockRetries < 1) {
-          root._flockRetries += 1
-          root.logEvent("watcher exited (code 3); another watcher may hold the flock — retrying in 3s")
-          watchRetry.restart()
-        } else {
-          root.logEvent("watcher exited (code 3); another watcher appears to hold the flock — click the health dot to force a restart")
-        }
-        return
-      }
-      if (root.watchRestarts >= 5) {
-        root.watchDead = true
-        root.logEvent("watcher crashed (code=" + exitCode + "); restart budget exhausted, routes will not reassert until shell reload or manual restart")
-        return
-      }
-      root.watchRestarts += 1
-      root.logEvent("watcher crashed (code=" + exitCode + "), restarting (" + root.watchRestarts + "/5) in 3s")
-      watchRetry.restart()
+      root._processExit("", exitCode)
     }
+  }
+
+  // Single dispatch point for watcher death. Two channels feed it — the helper
+  // prints a __WATCH_EXIT marker on stderr (collected via onStreamFinished,
+  // reliably delivered even when quickshell drops onExited for a clean
+  // non-zero exit), and onExited carries the numeric code for signal deaths
+  // (SIGKILL 9, SIGTERM 15). For a given death either or both may arrive; the
+  // 200ms de-dup window covers the double-firing case since consecutive
+  // watcher exits are always seconds apart.
+  function _processExit(reason, code) {
+    if (root._stopping) {
+      root._stopping = false
+      return
+    }
+    var now = Date.now()
+    if (now - root._lastExit < 200) return
+    root._lastExit = now
+    var wasAlive = root.watchAlive
+    root.watchAlive = false
+    if (root.watchDead) return
+    if (reason === "flock" || code === 3) {
+      // Flock conflict (or the parent-gone variant, also exit 3) — retried
+      // once per episode, since the orphaned holder of a reloaded shell clears
+      // within its own next poll; the slow re-arm then takes over.
+      if (root._flockRetries < 1) {
+        root._flockRetries += 1
+        root.logEvent("watcher exited with the flock contended; another watcher may be running — retrying in 3s")
+        watchRetry.restart()
+      } else {
+        root._flockRetries = 0
+        root.logEvent("watcher stopped (flock contended); will re-arm if still needed")
+        watchRearm.restart()
+      }
+      return
+    }
+    if (reason === "parent" || code === 15 || code === 0) {
+      if (wasAlive) return // late SIGTERM from a stop whose respawn already started
+      root.logEvent("watcher stopped (code " + code + "); will re-arm if still needed")
+      watchRearm.restart()
+      return
+    }
+    root._crash(code || 9)
+  }
+
+  function _crash(code) {
+    root.watchAlive = false
+    if (root.watchRestarts >= 5) {
+      root.watchDead = true
+      root.logEvent("watcher crashed (code=" + code + "); restart budget exhausted, routes will not reassert until shell reload or manual restart")
+      return
+    }
+    root.watchRestarts += 1
+    root.logEvent("watcher crashed (code=" + code + "), restarting (" + root.watchRestarts + "/5) in 3s")
+    watchRetry.restart()
   }
 
   Timer {
@@ -136,10 +187,62 @@ BarWidget {
     running: false
     onTriggered: {
       if (root.watchDead) return
-      root._suppressExit += 1
+      root._stopping = true
       watchProc.running = false
       watchProc.running = true
     }
+  }
+
+  // Clears the flock-retry budget once a sibling process has demonstrably
+  // survived the startup window (3s), i.e. the contention episode is over.
+  Timer {
+    id: watchSurvived
+    interval: 3000
+    running: false
+    onTriggered: {
+      root._flockRetries = 0
+    }
+  }
+
+  // Slow quiet re-arm: a transient flock conflict (e.g. the orphaned watcher
+  // of a SIGKILLed shell) clears on its own within its next poll, so a stopped
+  // watcher should recover without demanding a manual click.
+  Timer {
+    id: watchRearm
+    interval: 30000
+    running: false
+    onTriggered: {
+      if (root.watchDead || root.watchAlive) return
+      root.logEvent("watcher re-arming after intentional stop")
+      root._stopping = true
+      watchProc.running = false
+      watchProc.running = true
+    }
+  }
+
+  // Absolute backstop: if a death notification is dropped by the engine
+  // entirely (both channels fail) and nothing is scheduled, nudge a re-arm.
+  Timer {
+    id: watchLost
+    interval: 20000
+    running: true
+    repeat: true
+    onTriggered: {
+      if (root.watchAlive || root.watchDead || root._stopping) return
+      if (watchRetry.running || watchRearm.running) return
+      root.logEvent("watcher liveness check: nothing running, re-arming")
+      root._stopping = true
+      watchProc.running = false
+      watchProc.running = true
+    }
+  }
+
+  // On plugin/config reload the widget is torn down while the shell lives on.
+  // Explicitly stop the tracked watcher so it never rattles through a crash
+  // restart mid-teardown.
+  Component.onDestruction: {
+    root._stopping = true
+    watchProc.running = false
   }
 
   Loader {

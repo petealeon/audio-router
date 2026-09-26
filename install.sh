@@ -26,9 +26,11 @@ command -v omarchy >/dev/null 2>&1 || fail "omarchy not found — this installer
 
 remove() {
   local purge=${1:-0}
-  # Stop the rule-reassertion watcher (it survives plugin removal on its own,
-  # keeping the routing rules alive; only a purge should fully take that over).
-  pkill -f "omarchy-router watch" 2>/dev/null || true
+  # Stop the rule-reassertion watcher anchored to this plugin's own helper path
+  # (survives plugin removal on its own, keeping the routing rules alive; only a
+  # purge should fully take that over). Path-prefixed so it can never match an
+  # unrelated process whose command line merely contains the same string.
+  pkill -f "${DEST}/assets/omarchy-router watch" 2>/dev/null || true
   if omarchy plugin list 2>/dev/null | grep -q "^${PLUGIN_ID}$"; then
     omarchy plugin remove "$PLUGIN_ID" --yes || fail "omarchy plugin remove failed"
   elif [[ -d $DEST ]]; then

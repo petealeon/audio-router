@@ -1,0 +1,567 @@
+#!/usr/bin/env python3
+"""peter.router helper.
+
+Subcommands:
+  list                       emit the full routing state as one JSON line on stdout
+  set-sink <app> <binary> <node> <sink|__default__>
+                             persist a rule (removes it when sink is
+                             __default__) and move matching active streams now
+  remove <app-or-binary>     delete a rule and move matching streams to default
+  watch                      apply persisted rules on a 0.5s poll; exits when
+                             the parent that spawned it is gone; flock-singleton
+  selftest                   run the pure-function checks below (no pactl, no store)
+
+When a rule's target device has disconnected (e.g. a Bluetooth sink), matching
+streams are moved to the system default instead of being left muted on the
+vanished device; the rule itself is kept, so the watcher routes them back the
+moment the device returns.
+
+State is stored at ~/.config/omarchy/router-rules.json:
+  [ { "app": "Chromium", "binary": "chromium", "node": "",
+      "sink": "alsa_output.pci-..." }, ...]
+sink values are output NAMES (__default__ is never persisted).
+
+A rule stores whichever identity fields were visible at link time; streams are
+matched in order of specificity: process-binary basename, then PipeWire
+node.name basename, then application.name (trailing " input" ignored). Browser
+streams often omit process.binary but always have a node.name, so the node key
+is what keeps Brave/Chromium rules matching. EasyEffects is never steered.
+
+Store writes are serialized with an flock: writers take LOCK_EX around the whole
+read-modify-write, the watcher takes LOCK_SH for its reads, so two quick links
+can never drop each other's rule.
+"""
+
+import fcntl
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+RUNTIME = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+STORE = os.environ.get("ROUTER_STORE") or f"{os.path.expanduser('~')}/.config/omarchy/router-rules.json"
+LOCK = f"{RUNTIME}/omarchy-router.store.lock"
+WATCH_MARK = f"{RUNTIME}/omarchy-router.watch.lock"
+LOG = f"{RUNTIME}/omarchy-router.watch.log"
+
+EXCLUDE_APPS = {"EasyEffects", "Quickshell"}
+
+RE_APP = re.compile(r'^application\.name\s*=\s*"(.*)"')
+RE_BIN = re.compile(r'^application\.process\.binary\s*=\s*"(.*)"')
+RE_NODE = re.compile(r'^node\.name\s*=\s*"(.*)"')
+RE_SINK = re.compile(r'^Sink:\s*(\d+)')
+RE_VOL = re.compile(r'^Volume:\s+(?:\S+\s*:\s*)?(\d+)\s*/\s*(\d+)%')
+RE_VOL2 = re.compile(r'^Volume:\s+(\d+)%')
+RE_MUTE = re.compile(r'^Mute:\s*(yes|no)')
+
+
+def say(msg):
+    sys.stderr.write(f"omarchy-router: {msg}\n")
+    sys.stderr.flush()
+
+
+def run(cmd, timeout=4):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.stdout
+    except Exception:
+        return ""
+
+
+def basename(p):
+    return (p or "").rsplit("/", 1)[-1]
+
+
+def load_rules():
+    try:
+        with open(STORE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def write_rules(rules):
+    os.makedirs(os.path.dirname(STORE), exist_ok=True)
+    tmp = STORE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(rules, f, indent=2)
+    os.replace(tmp, STORE)
+
+
+def parse_sinks(raw):
+    sinks, cur = [], None
+    for line in raw.splitlines():
+        if line.startswith("Sink #"):
+            if cur and cur["name"]:
+                sinks.append(cur)
+            idx = line.split("#", 1)[1].strip().split()[0]
+            cur = {"index": idx, "name": "", "desc": "", "available": True}
+        elif cur:
+            t = line.strip()
+            if t.startswith("Name: "):
+                cur["name"] = t[6:].strip()
+            elif t.startswith("Description: "):
+                cur["desc"] = t[13:].strip()
+            elif t.startswith("State: "):
+                cur["available"] = t[7:].strip().upper() in ("RUNNING", "IDLE", "SUSPENDED")
+    if cur and cur["name"]:
+        sinks.append(cur)
+    return sinks
+
+
+def parse_inputs(raw, sink_by_index):
+    out, cur = [], None
+    for line in raw.splitlines():
+        s = line.strip()
+        if s.startswith("Sink Input #"):
+            if cur:
+                out.append(cur)
+            cur = {"id": s[12:], "appName": "", "binary": "", "nodeName": "", "sink": "", "sinkName": "", "volume": 0.0, "muted": False}
+        elif cur:
+            m = RE_APP.match(s)
+            if m:
+                cur["appName"] = m.group(1)
+                continue
+            m = RE_BIN.match(s)
+            if m:
+                cur["binary"] = basename(m.group(1))
+                continue
+            m = RE_NODE.match(s)
+            if m:
+                cur["nodeName"] = m.group(1)
+                continue
+            m = RE_SINK.match(s)
+            if m:
+                cur["sink"] = m.group(1)
+                continue
+            m = RE_VOL.match(s)
+            if m:
+                cur["volume"] = int(m.group(2)) / 100.0
+                continue
+            m = RE_VOL2.match(s)
+            if m:
+                cur["volume"] = int(m.group(1)) / 100.0
+                continue
+            m = RE_MUTE.match(s)
+            if m:
+                cur["muted"] = m.group(1).lower() == "yes"
+    if cur:
+        out.append(cur)
+    for e in out:
+        e["sinkName"] = sink_by_index.get(e["sink"], {}).get("name", "")
+    return out
+
+
+def parse_clients(raw):
+    out, seen, cur = {}, set(), {}
+
+    def finish():
+        app = cur.get("appName", "")
+        if app and app not in EXCLUDE_APPS:
+            key = (cur.get("binary") or app).lower()
+            if key not in seen:
+                seen.add(key)
+                out[key] = {"appName": app, "binary": cur.get("binary", "")}
+
+    for line in raw.splitlines():
+        if line.startswith("Client #"):
+            finish()
+            cur = {}
+            continue
+        s = line.strip()
+        m = RE_APP.match(s)
+        if m:
+            cur["appName"] = m.group(1)
+            continue
+        m = RE_BIN.match(s)
+        if m:
+            cur["binary"] = basename(m.group(1))
+    finish()
+    return list(out.values())
+
+
+def is_valid_input(e):
+    return e["appName"] not in EXCLUDE_APPS
+
+
+def norm(s):
+    return (s or "").strip().lower()
+
+
+def strip_input(s):
+    s = s or ""
+    if s.lower().endswith(" input"):
+        t = s[: -len(" input")].rstrip()
+        return t if t else s
+    return s
+
+
+def key_of_r(r):
+    if not r:
+        return ""
+    b = norm(basename(r.get("binary", "")))
+    if b:
+        return b
+    n = norm(basename(r.get("node", "")))
+    if n:
+        return n
+    return norm(strip_input(r.get("app", "")))
+
+
+def identities_overlap(a, b):
+    """True when two identity dicts (either rule shape {app,binary,node} or
+    stream shape {appName,binary,nodeName}) name the same app. Matched in
+    order of specificity: process-binary basename, then node.name basename,
+    then application.name with a trailing " input" ignored."""
+    ab = norm(basename(a.get("binary", "")))
+    an = norm(basename(a.get("nodeName", "") or a.get("node", "")))
+    aa = norm(strip_input(a.get("appName", "") or a.get("app", "")))
+    bb = norm(basename(b.get("binary", "")))
+    bn = norm(basename(b.get("nodeName", "") or b.get("node", "")))
+    ba = norm(strip_input(b.get("appName", "") or b.get("app", "")))
+    if ab and bb and ab == bb:
+        return True
+    if an and bn and an == bn:
+        return True
+    if aa and ba and aa == ba:
+        return True
+    return False
+
+
+def match_rule(e, rules):
+    for r in rules:
+        if identities_overlap(e, r):
+            return r
+    return None
+
+
+def acquire_ex(fd, timeout=2.0):
+    end = time.monotonic() + timeout
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            if time.monotonic() >= end:
+                say(f"could not acquire store lock within {timeout}s — proceeding without it")
+                return False
+            time.sleep(0.02)
+
+
+def read_store_locked():
+    rules = []
+    try:
+        with open(LOCK, "w", encoding="utf-8") as fd:
+            fcntl.flock(fd, fcntl.LOCK_SH)
+            rules = load_rules()
+    except Exception:
+        rules = load_rules()
+    return rules
+
+
+def modify_store(mutator):
+    os.makedirs(os.path.dirname(STORE), exist_ok=True)
+    with open(LOCK, "w", encoding="utf-8") as fd:
+        acquire_ex(fd)
+        rules = mutator(load_rules())
+        tmp = STORE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(rules, f, indent=2)
+        os.replace(tmp, STORE)
+
+
+def move(id_, sink_name):
+    if not id_ or not sink_name:
+        return
+    run(["pactl", "move-sink-input", id_, sink_name], timeout=2)
+
+
+def wlog(msg):
+    try:
+        with open(LOG, "a", encoding="utf-8") as f:
+            f.write(f"[{time.strftime('%T')}] {msg}\n")
+    except OSError:
+        pass
+
+
+def effective_sink(target, sinks, default=None):
+    """Sink name to actually steer a stream to for a persisted rule.
+
+    If the rule's target device is currently present, return it unchanged.
+    If it has disconnected, return the live default sink instead — the stream
+    is never left muted on a vanished device, and the rule itself is preserved
+    so the next poll with the device present re-asserts it. Returns "" when
+    neither the target nor the default is usable. `default` is injectable for
+    tests; when None it is read from pactl.
+    """
+    if not target:
+        return ""
+    names = {s["name"] for s in sinks}
+    if target in names:
+        return target
+    if default is None:
+        default = run(["pactl", "get-default-sink"]).strip() or ""
+    if default in names:
+        return default
+    return ""
+
+
+def cmd_list():
+    sinks = parse_sinks(run(["pactl", "list", "sinks"]))
+    sink_by_index = {s["index"]: s for s in sinks}
+    inputs = parse_inputs(run(["pactl", "list", "sink-inputs"]), sink_by_index)
+    clients = parse_clients(run(["pactl", "list", "clients"]))
+    default_sink = run(["pactl", "get-default-sink"]).strip()
+    payload = {
+        "sinks": sinks,
+        "defaultSink": default_sink,
+        "sinkInputs": [e for e in inputs if is_valid_input(e)],
+        "clients": clients,
+        "rules": load_rules(),
+    }
+    print(json.dumps(payload))
+    sys.stdout.flush()
+
+
+def replace_rule(rules, app, binary, node, sink):
+    """Store mutation for a pin/unpin: drop any rule naming the same app
+    (matched by identity, not just key, so a rule pinned before its
+    process.binary appeared still gets replaced) and persist the new one
+    unless the sink is __default__."""
+    pin = {"app": app, "binary": basename(binary or ""), "node": node}
+    kept = [r for r in rules if not identities_overlap(pin, r)]
+    if sink != "__default__":
+        kept.append({"app": app, "binary": basename(binary or ""), "node": node, "sink": sink})
+    return kept
+
+
+def cmd_set(app, binary, node, sink_name):
+    app = app or ""
+    node = node or ""
+    key = key_of_r({"app": app, "binary": binary, "node": node})
+    target = "__default__" if (not sink_name or sink_name == "__default__") else sink_name
+    say(f"set-sink key={key!r} app={app!r} binary={binary!r} node={node!r} sink={target}")
+
+    modify_store(lambda rules: replace_rule(rules, app, binary, node, target))
+    actual = target if target != "__default__" else run(["pactl", "get-default-sink"]).strip()
+    move_matching(app, binary, node, actual)
+
+
+def cmd_remove(app_or_binary):
+    cmd_set(app_or_binary, "", "", "__default__")
+
+
+def move_matching(app, binary, node, target):
+    sinks = parse_sinks(run(["pactl", "list", "sinks"]))
+    sink_by_index = {s["index"]: s for s in sinks}
+    inputs = parse_inputs(run(["pactl", "list", "sink-inputs"]), sink_by_index)
+    eff = effective_sink(target, sinks)
+    if not eff:
+        say(f"sink {target!r} missing and no default available; skipping moves")
+        return
+    if eff != target:
+        say(f"sink missing ({target}) -> default ({eff})")
+    rule = {"app": app, "binary": binary, "node": node, "sink": eff}
+    for e in inputs:
+        if not is_valid_input(e):
+            continue
+        if match_rule(e, [rule]) and e["sinkName"] != eff:
+            move(e["id"], eff)
+
+
+def cmd_watch():
+    mark = open(WATCH_MARK, "w")
+    try:
+        fcntl.flock(mark, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        say("watch: another watcher is already running")
+        sys.exit(3)
+    parent = os.getppid()
+    try:
+        os.unlink(LOG)
+    except OSError:
+        pass
+    say(f"watch: started (parent {parent}, store {STORE})")
+    traced = {}
+    missing_reported = {}
+    while True:
+        try:
+            if os.getppid() != parent:
+                say("watch: parent is gone — exiting")
+                sys.exit(3)
+            rules = read_store_locked()
+            if rules:
+                sinks = parse_sinks(run(["pactl", "list", "sinks"]))
+                sink_by_index = {s["index"]: s for s in sinks}
+                inputs = [e for e in parse_inputs(run(["pactl", "list", "sink-inputs"]), sink_by_index) if is_valid_input(e)]
+                moved = 0
+                for e in inputs:
+                    r = match_rule(e, rules)
+                    if not r or not r.get("sink"):
+                        if r is None:
+                            tk = norm(basename(e.get("binary", ""))) or norm(basename(e.get("nodeName", ""))) or norm(e.get("appName", ""))
+                            if time.monotonic() - traced.get(tk, 0) > 10:
+                                traced[tk] = time.monotonic()
+                                wlog(f"no rule match: app={e.get('appName','')!r} bin={e.get('binary','')!r} node={e.get('nodeName','')!r}")
+                        continue
+                    if r["sink"] == "__default__":
+                        continue
+                    eff = effective_sink(r["sink"], sinks)
+                    if not eff:
+                        continue
+                    if eff != r["sink"]:
+                        if r["sink"] not in missing_reported:
+                            missing_reported[r["sink"]] = True
+                            wlog(f"sink missing ({r['sink']}) -> default ({eff})")
+                    else:
+                        missing_reported.pop(r["sink"], None)
+                    if e["sinkName"] == eff:
+                        continue
+                    move(e["id"], eff)
+                    moved += 1
+                if moved:
+                    wlog(f"rules reasserted ({moved} stream{'s' if moved != 1 else ''})")
+        except Exception as ex:
+            say(f"watch: poll error: {ex}")
+        time.sleep(0.5)
+
+
+CANONICAL_SINKS = """Sink #88
+\tState: RUNNING
+\tName: alsa_output.pci-0000_00_1f.3.analog-stereo
+\tDescription: Built-in Audio Analog Stereo
+Sink #93
+\tState: SUSPENDED
+\tName: bluez_output.24_06_11_A5_E7_95.1
+\tDescription: WH-1000XM4
+Sink #60
+\tState: RUNNING
+\tName: alsa_output.usb-Generic_ThinkPad_Dock_USB_Audio-00.analog-stereo
+\tDescription: ThinkPad Dock USB Audio Analog Stereo
+"""
+
+CANONICAL_INPUTS = """Sink Input #2021
+\tApplication: PROCESS.PACKAGE.NAME = "..."
+\tMedia Class: Audio/Video
+\tNode Name: "brave_WebContentsAudioStream"
+\tapplication.name = "Brave"
+\tapplication.process.binary = "/usr/lib/brave-bin/brave"
+\tapplication.process.id = 2012
+\tMute: no
+\tVolume: front-left: 65536 / 100% / 0.00 dB,   front-right: 65536 / 100% / 0.00 dB
+\tSink: 60
+Sink Input #2022
+\tapplication.name = "mpv"
+\tnode.name = "mpv"
+\tapplication.process.binary = "/usr/bin/mpv"
+\tMute: no
+\tVolume: 60%
+\tSink: 93
+Sink Input #2023
+\tnode.name = "WebKitWebContent"
+\tapplication.name = "Signal input"
+\tapplication.process.binary = "/usr/bin/signal-desktop"
+\tMute: yes
+\tVolume: front-left: 32768 / 50% / -6.02 dB,   front-right: 32768 / 50% / -6.02 dB
+\tSink: 88
+"""
+
+
+def selftest():
+    """Zero-I/O sanity checks for the pure parsers and matchers.
+
+    Every helper here runs on canned text only: no pactl, no store, no lock.
+    Runs in CI or after a deploy: `omarchy-router selftest`.
+    """
+    checks = []
+
+    def check(name, got, want):
+        ok = got == want
+        checks.append((name, ok))
+        print(f"  {'PASS' if ok else 'FAIL'}  {name}: {got!r}" + ("" if ok else f" (want {want!r})"))
+
+    sinks = parse_sinks(CANONICAL_SINKS)
+    check("parse_sinks count", len(sinks), 3)
+    check("parse_sinks names", [s["name"] for s in sinks],
+          ["alsa_output.pci-0000_00_1f.3.analog-stereo", "bluez_output.24_06_11_A5_E7_95.1",
+           "alsa_output.usb-Generic_ThinkPad_Dock_USB_Audio-00.analog-stereo"])
+    check("parse_sinks availability", [s["available"] for s in sinks], [True, True, True])
+
+    sink_by_index = {s["index"]: s for s in sinks}
+    inputs = parse_inputs(CANONICAL_INPUTS, sink_by_index)
+    check("parse_inputs count", len(inputs), 3)
+    check("parse_inputs binary basename", [e["binary"] for e in inputs], ["brave", "mpv", "signal-desktop"])
+    check("parse_inputs sinkName", [e["sinkName"] for e in inputs],
+          ["alsa_output.usb-Generic_ThinkPad_Dock_USB_Audio-00.analog-stereo",
+           "bluez_output.24_06_11_A5_E7_95.1", "alsa_output.pci-0000_00_1f.3.analog-stereo"])
+    check("parse_inputs volume (%)", [e["volume"] for e in inputs], [1.0, 0.6, 0.5])
+    check("parse_inputs muted", [e["muted"] for e in inputs], [False, False, True])
+
+    target = "bluez_output.24_06_11_A5_E7_95.1"
+    dflt = "alsa_output.usb-Generic_ThinkPad_Dock_USB_Audio-00.analog-stereo"
+    check("effective_sink present", effective_sink(target, sinks, dflt), target)
+    check("effective_sink missing->default", effective_sink("bluez_output.gone.1", sinks, dflt), dflt)
+    check("effective_sink both absent", effective_sink("bluez_output.gone.1",
+                                                       [s for s in sinks if s["name"] != dflt], "gone-default"), "")
+
+    rules = [
+        {"app": "Brave", "binary": "brave", "node": "", "sink": target},
+        {"app": "mpv", "binary": "", "node": "mpv", "sink": target},
+        {"app": "Signal", "binary": "", "node": "WebKitWebContent", "sink": dflt},
+    ]
+    check("match_rule binary", match_rule(inputs[0], rules)["sink"], target)
+    check("match_rule node", match_rule(inputs[1], rules)["sink"], target)
+    check("match_rule app(no bin)", match_rule({"appName": "Chromium", "binary": "", "nodeName": ""}, rules), None)
+    check("key_of_r binary>node>app",
+          [key_of_r(r) for r in rules], ["brave", "mpv", "webkitwebcontent"])
+
+    drift_pin = {"app": "Brave", "binary": "brave", "node": ""}
+    drift_stored = {"app": "Brave", "binary": "", "node": "Brave", "sink": "old-target"}
+    check("identity drift still overlaps", identities_overlap(drift_pin, drift_stored), True)
+
+    boot = [
+        {"app": "mpv", "binary": "", "node": "mpv", "sink": "old"},
+        {"app": "Signal", "binary": "signal-desktop", "node": "", "sink": "old"},
+    ]
+    merged = replace_rule(boot, "mpv", "", "mpv", "new")
+    check("replace_rule replaces by identity", [r for r in merged if key_of_r(r) == "mpv"],
+          [{"app": "mpv", "binary": "", "node": "mpv", "sink": "new"}])
+    check("replace_rule keeps unrelated", sorted(key_of_r(r) for r in merged), ["mpv", "signal-desktop"])
+    removed = replace_rule(boot, "mpv", "", "mpv", "__default__")
+    check("replace_rule removes on __default__", [key_of_r(r) for r in removed], ["signal-desktop"])
+    check("replace_rule unpinned sink never persisted", all(r["sink"] != "__default__" for r in removed), True)
+
+    check("strip_input", strip_input("Signal input"), "Signal")
+    check("basename", basename("/usr/lib/brave-bin/brave"), "brave")
+
+    failed = [name for name, ok in checks if not ok]
+    print(f"selftest: {len(checks) - len(failed)}/{len(checks)} passed")
+    return 1 if failed else 0
+
+
+def main():
+    args = sys.argv[1:]
+    if not args:
+        say("usage: omarchy-router list | set-sink <app> <binary> <sink|__default__> | remove <app-or-binary> | watch | selftest")
+        sys.exit(2)
+    cmd, rest = args[0], args[1:]
+    if cmd == "list":
+        cmd_list()
+    elif cmd == "set-sink" and len(rest) >= 4:
+        cmd_set(rest[0], rest[1], rest[2], rest[3])
+    elif cmd == "remove" and rest:
+        cmd_remove(rest[0])
+    elif cmd == "watch":
+        cmd_watch()
+    elif cmd == "selftest":
+        sys.exit(selftest())
+    else:
+        say(f"unknown command or bad arguments: {cmd} {rest}")
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()

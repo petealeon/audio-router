@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "peter.router",
+  "name": "Audio Router",
+  "version": "1.1.0",
+  "author": "peter",
+  "description": "Persistent per-app audio routing: link any app to any output from a dedicated two-column patchbay widget",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Audio Router",
+    "description": "Two-column patchbay for routing apps to outputs, with persistent pinned rules",
+    "category": "Info",
+    "defaultSection": "right",
+    "allowMultiple": false
+  }
+}

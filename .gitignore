@@ -1,0 +1,8 @@
+# Local state that must never enter the repo
+router-rules.json
+.bak.*
+*.tmp
+
+# Python
+__pycache__/
+*.pyc

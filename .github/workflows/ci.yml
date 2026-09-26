@@ -1,0 +1,29 @@
+name: ci
+on: [push, pull_request]
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Helper selftest
+        run: python3 assets/omarchy-router selftest
+
+      - name: Installer syntax
+        run: bash -n install.sh
+
+      - name: Manifest integrity
+        run: python3 scripts/check-manifest.py
+
+      - name: QML lint (when qmllint is available)
+        run: |
+          if command -v qmllint >/dev/null 2>&1; then
+            qmllint BarWidget.qml Panel.qml Model.js
+          else
+            echo "skip: qmllint not installed"
+          fi

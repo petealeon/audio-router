@@ -36,6 +36,7 @@ import fcntl
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -309,10 +310,24 @@ def effective_sink(target, sinks, default=None):
     return ""
 
 
+def describe_issues(sinks_raw, pactl_found):
+    """Diagnostics for a degraded pactl read. An empty sink-inputs list is a
+    normal idle state, so only the sink read and pactl's presence matter.
+    Pure: feeds ``list``'s ``error`` field and the selftest."""
+    issues = []
+    if not pactl_found:
+        issues.append("pactl not found")
+    elif not sinks_raw:
+        issues.append("pactl returned no sink data")
+    return issues
+
+
 def cmd_list():
-    sinks = parse_sinks(run(["pactl", "list", "sinks"]))
+    sinks_raw = run(["pactl", "list", "sinks"])
+    inputs_raw = run(["pactl", "list", "sink-inputs"])
+    sinks = parse_sinks(sinks_raw)
     sink_by_index = {s["index"]: s for s in sinks}
-    inputs = parse_inputs(run(["pactl", "list", "sink-inputs"]), sink_by_index)
+    inputs = parse_inputs(inputs_raw, sink_by_index)
     clients = parse_clients(run(["pactl", "list", "clients"]))
     default_sink = run(["pactl", "get-default-sink"]).strip()
     payload = {
@@ -322,6 +337,9 @@ def cmd_list():
         "clients": clients,
         "rules": load_rules(),
     }
+    issues = describe_issues(sinks_raw, shutil.which("pactl") is not None)
+    if issues:
+        payload["error"] = "; ".join(issues)
     print(json.dumps(payload))
     sys.stdout.flush()
 
@@ -426,6 +444,7 @@ def cmd_watch():
                     wlog(f"rules reasserted ({moved} stream{'s' if moved != 1 else ''})")
         except Exception as ex:
             say(f"watch: poll error: {ex}")
+            wlog(f"poll error: {ex}")
         time.sleep(0.5)
 
 
@@ -536,6 +555,11 @@ def selftest():
 
     check("strip_input", strip_input("Signal input"), "Signal")
     check("basename", basename("/usr/lib/brave-bin/brave"), "brave")
+
+    check("describe_issues clean", describe_issues("Sink #88", True), [])
+    check("describe_issues no sinks", describe_issues("", True), ["pactl returned no sink data"])
+    check("describe_issues pactl missing", describe_issues("Sink #88", False), ["pactl not found"])
+    check("describe_issues pactl missing and no sinks", describe_issues("", False), ["pactl not found"])
 
     failed = [name for name, ok in checks if not ok]
     print(f"selftest: {len(checks) - len(failed)}/{len(checks)} passed")

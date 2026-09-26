@@ -25,6 +25,13 @@ Re-installing over a newer version never clobbers it: the current plugin dir is
 copied to `.peter.router.bak.<timestamp>` next to the plugins folder (the 3
 newest backups are kept).
 
+## Marketplace
+
+Listed on the Omarchy plugin marketplace (plugins.omarchy.org) — install,
+update and review it there. The repository at the point of a tagged release
+(`vX.Y.Z`) is always the source of truth; see `docs/marketplace-submission.md`
+for the listing details.
+
 ## Uninstall
 
 ```sh

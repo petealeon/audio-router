@@ -69,6 +69,9 @@ Panel {
   property string defaultSinkName: ""
   property string stateSignature: ""
   property bool stateLoaded: false
+  // Set when the helper's `list` read of pactl is degraded (missing sinks or
+  // streams); shown on the status line and in the health tooltip.
+  property string stateError: ""
 
   property var appRows: []
   property var outputRows: []
@@ -103,6 +106,7 @@ Panel {
   readonly property int watchStatusWidth: Style.space(84)
 
   function watchColor() {
+    if (root.stateError) return Qt.rgba(0.72, 0.55, 0.2, 1)
     if (!root.hostWidget) return root.textColor
     if (root.hostWidget.watchDead) return Qt.rgba(0.88, 0.2, 0.2, 1)
     if (!root.hostWidget.watchAlive) return Qt.rgba(0.45, 0.48, 0.55, 1)
@@ -111,6 +115,7 @@ Panel {
   }
 
   function watchStatusText() {
+    if (root.stateError) return "no pactl"
     if (!root.hostWidget) return "watch"
     if (root.hostWidget.watchDead) return "dead"
     if (!root.hostWidget.watchAlive) return "stopped"
@@ -121,7 +126,9 @@ Panel {
   function watchTooltip() {
     var v = (root.hostWidget && root.hostWidget.version) ? root.hostWidget.version : "?"
     var pid = (root.hostWidget && root.hostWidget.watchPid) ? root.hostWidget.watchPid : 0
-    return "peter.router v" + v + " · watcher " + root.watchStatusText() + (pid ? " (pid " + pid + ")" : "") + "\nclick to restart"
+    var s = "peter.router v" + v + " · watcher " + root.watchStatusText() + (pid ? " (pid " + pid + ")" : "") + "\nclick to restart"
+    if (root.stateError) s += "\n" + root.stateError
+    return s
   }
   readonly property var systemBinaries: {
     var s = {}
@@ -196,6 +203,7 @@ Panel {
     var obj
     try { obj = JSON.parse(raw) } catch (e) { return }
     if (!obj) return
+    root.stateError = obj.error || ""
     if (root.dragging) return
 
     root._clientCount = root._clientCount || {}

@@ -46,8 +46,11 @@ drop_legacy() {
       omarchy plugin remove "$legacy" --yes >/dev/null 2>&1 || true
     fi
     [[ -d $dest ]] && rm -rf "$dest"
-    # `omarchy plugin remove` disables the plugin but leaves its entry in the
-    # persisted bar layout, which would keep a dead widget slot in the bar.
+    # Safety net, not the normal path. Observed on omarchy 4.0.3: `omarchy
+    # plugin remove` already drops the bar entry, and this block does not run.
+    # It stays because the plugin is renamed, and a stale entry would show the
+    # widget twice, so it is cheap insurance against a CLI that leaves the
+    # persisted bar layout alone.
     if [[ -f $SHELL_JSON ]] && command -v jq >/dev/null 2>&1 &&
        jq -e --arg id "$legacy" '.bar.layout[][]? | select(.id == $id)' "$SHELL_JSON" >/dev/null 2>&1; then
       local tmp="${SHELL_JSON}.router.tmp.$$"
@@ -74,7 +77,7 @@ remove() {
   # purge should fully take that over). Path-prefixed so it can never match an
   # unrelated process whose command line merely contains the same string.
   pkill -f "${DEST}/assets/omarchy-router watch" 2>/dev/null || true
-  if omarchy plugin list 2>/dev/null | grep -q "^${PLUGIN_ID}$"; then
+  if omarchy plugin list 2>/dev/null | grep -qE "^${PLUGIN_ID}[[:space:]]"; then
     omarchy plugin remove "$PLUGIN_ID" --yes || fail "omarchy plugin remove failed"
   elif [[ -d $DEST ]]; then
     rm -rf "$DEST"

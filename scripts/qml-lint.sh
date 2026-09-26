@@ -15,9 +15,9 @@
 #
 # Exit status: qmllint returns 0 for warnings and non-zero for parse errors,
 # so this fails the build on a QML file that will not load and stays advisory
-# about style/unresolved-member warnings. That distinction matters: without the
-# omarchy shell (as in GitHub Actions) the qs.* types cannot resolve, and we
-# still want syntax checking.
+# about style/unresolved-member warnings. The qs.* modules are always made to
+# resolve (real ones when the omarchy shell is installed, stubs otherwise) so
+# that a version difference in how imports are graded cannot fail the build.
 
 set -uo pipefail
 
@@ -39,42 +39,80 @@ if [ -z "$qmllint" ]; then
 fi
 
 shell_dir="${OMARCHY_SHELL:-/usr/share/omarchy/shell}"
-imports=()
-shim=""
+
+# The shim is built unconditionally. When the omarchy shell is present we point
+# qs.Ui/qs.Commons at the real module directories; when it is not (GitHub
+# Actions, or any machine without omarchy) we stub them with a bare qmldir so
+# the imports still *resolve*. That matters: qmllint 6.4.x, which is what Ubuntu
+# ships and therefore what CI runs, treats an unresolvable module import as a
+# fatal error rather than a warning, so without the stubs the job fails on
+# `import qs.Ui` instead of doing the syntax check it claims to do. The cost of a
+# stub is that the omarchy types are unresolved, which is only a warning.
+shim="$(mktemp -d)"
 cleanup() { [ -n "$shim" ] && rm -rf "$shim"; }
 trap cleanup EXIT
 
-if [ -f "$shell_dir/Ui/qmldir" ]; then
-  shim="$(mktemp -d)"
-  mkdir -p "$shim/qs"
-  for mod in Ui Commons; do
-    [ -d "$shell_dir/$mod" ] && ln -sfn "$shell_dir/$mod" "$shim/qs/$mod"
-  done
-  imports=(-I "$shim")
+mkdir -p "$shim/qs"
+with_shell=0
+[ -f "$shell_dir/Ui/qmldir" ] && with_shell=1
+for mod in Ui Commons; do
+  if [ -d "$shell_dir/$mod" ]; then
+    ln -sfn "$shell_dir/$mod" "$shim/qs/$mod"
+  else
+    mkdir -p "$shim/qs/$mod"
+    printf 'module qs.%s\n' "$mod" >"$shim/qs/$mod/qmldir"
+  fi
+done
+imports=(-I "$shim")
+
+if [ "$with_shell" = 1 ]; then
   echo "qml-lint: $("$qmllint" --version 2>&1 | head -1) with omarchy imports from $shell_dir"
 else
   echo "qml-lint: $("$qmllint" --version 2>&1 | head -1), no omarchy shell at $shell_dir"
-  echo "qml-lint: qs.Ui/qs.Commons will not resolve; checking syntax only"
+  echo "qml-lint: qs.Ui/qs.Commons stubbed; omarchy types unresolved, checking syntax"
 fi
 
 cd "$root" || exit 1
-out="$("$qmllint" "${imports[@]}" BarWidget.qml Panel.qml Model.js 2>&1)"
+
+# Pass -W -1 (max-warnings = unlimited) only where the tool understands it: it was
+# added after 6.4, and 6.4.2 rejects the flag outright with "Unknown options".
+# It is probed rather than assumed, and nothing below depends on it -- the
+# pass/fail decision is made from the diagnostics, not from the exit code.
+flags=()
+if "$qmllint" --help 2>&1 | grep -q -- '--max-warnings'; then
+  flags=(-W -1)
+fi
+
+out="$("$qmllint" "${flags[@]}" "${imports[@]}" BarWidget.qml Panel.qml Model.js 2>&1)"
 status=$?
 
-warnings="$(printf '%s\n' "$out" | grep -cE '^(Warning|Error):' || true)"
+warnings="$(printf '%s\n' "$out" | grep -cE '^Warning:' || true)"
+# A QML file that will not load shows up as a syntax diagnostic, on every
+# version tried (6.4.2 and 6.11.2 both tag it "[syntax]"). Everything else here
+# is advisory: unresolved types and unqualified access are expected whenever the
+# omarchy shell is not installed, which is the normal case in CI.
+syntax="$(printf '%s\n' "$out" | grep -cE '\[syntax\]|^Error:' || true)"
 
 if [ "${1:-}" = "--verbose" ]; then
   printf '%s\n' "$out"
 else
   # Headlines only. The full qmllint output is mostly caret diagrams and
-  # "Info:" explanations, which drown the signal at ~90 warnings.
+  # "Info:" explanations, which drown the signal at ~120 warnings.
   printf '%s\n' "$out" | grep -E '^(Warning|Error):' || true
   echo "qml-lint: (use --verbose for source context)"
 fi
 
-if [ "$status" -ne 0 ]; then
-  echo "qml-lint: FAIL (qmllint exit $status) — parse errors above" >&2
-  exit "$status"
+# qmllint refusing the invocation is a failure of the check itself, not of the
+# code, and must not be mistaken for a clean run.
+if printf '%s\n' "$out" | grep -q 'Unknown options'; then
+  echo "qml-lint: FAIL -- this qmllint rejected the arguments:" >&2
+  printf '%s\n' "$out" | grep -i 'unknown options' >&2
+  exit 1
+fi
+
+if [ "$syntax" -gt 0 ]; then
+  echo "qml-lint: FAIL -- $syntax syntax diagnostic(s); this QML will not load" >&2
+  exit 1
 fi
 
 echo "qml-lint: ok, $warnings warning(s) (advisory)"

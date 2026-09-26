@@ -27,9 +27,9 @@ newest backups are kept).
 
 Upgrading from the old `peter.router` id needs no manual step — just run
 `./install.sh`. The installer notices the superseded id, stops its watcher,
-unregisters the old plugin, strips its stale bar entry and re-adds the widget
-under `petealeon.router` in the same right-hand section. Your routing rules in
-`~/.config/omarchy/router-rules.json` are never touched by the rename.
+unregisters the old plugin (which also removes its bar entry) and re-adds the
+widget under `petealeon.router` in the same right-hand section. Your routing
+rules in `~/.config/omarchy/router-rules.json` are never touched by the rename.
 
 ## Marketplace
 

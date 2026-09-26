@@ -417,7 +417,6 @@ def cmd_restore():
     # Restore all valid sink inputs to the system default sink, without touching
     # the stored rules. Flock the watch lock (bounded) so the watcher cannot
     # concurrently re-assert pins while we're moving streams.
-    parent = os.getppid()
     try:
         mark = open(WATCH_MARK, "w")
     except OSError:

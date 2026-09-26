@@ -16,6 +16,93 @@ Panel {
   property var hostWidget: null
   readonly property var barIdentity: hostWidget || root
 
+  // KeyboardPanel owns the popup window, keyboard-focus priming, outside-click
+  // dismissal, popout coordination and the bar-strip mask, but it only offers
+  // `centerOnBar` (screen centre) versus icon-centred placement, and its
+  // `cardOrigin` is readonly. Neither KeyboardPanel nor PopupCard exposes a
+  // section/corner mode, so a card flush with the bar section's screen corner
+  // cannot be asked for through the public API. Its card is reachable from
+  // content this plugin owns (content -> contentHolder -> card), so the two
+  // Bindings below take over x/y only and every other behaviour is inherited.
+  readonly property var card: {
+    var holder = keyCatcher ? keyCatcher.parent : null
+    var candidate = holder ? holder.parent : null
+    // BorderSurface is the only ancestor exposing contentTopInset. Requiring
+    // it keeps the override from latching onto an unrelated item should the
+    // shell restructure its content hierarchy; when it does not resolve, the
+    // bindings disable and KeyboardPanel's own positioning stands.
+    return candidate && candidate.contentTopInset !== undefined ? candidate : null
+  }
+
+  // Top-left of the card in screen coordinates, replacing cardOrigin.
+  // Perpendicular axis (away from the bar) keeps KeyboardPanel's rule: the
+  // bar occupies that edge, so the card sits a `gap` clear of it. Parallel
+  // axis (along the bar) is flush with the screen end nearest the icon, so a
+  // widget sitting at the end of its section opens in that section's corner
+  // rather than wherever the icon happens to be. Inside the deadzone the
+  // shell's icon-centred placement is kept, which is the right reading for a
+  // centre-section widget where "flush" has no meaningful answer.
+  //
+  // Everything read here is reactive: anchorScreenPos is a shell binding fed by
+  // a TransformWatcher, so dragging the entry to another section re-derives
+  // the flush end with no extra wiring here.
+  function cardOrigin() {
+    var w = panel.contentWidth
+    var h = panel.contentHeight
+    var sw = panel.screenW
+    var sh = panel.screenH
+    var m = panel.margin
+    var gap = panel.gap
+    var pos = panel.barPos
+    var verticalBar = pos === "left" || pos === "right"
+    var x = 0
+    var y = 0
+
+    if (pos === "top") y = panel.barH + gap
+    else if (pos === "bottom") y = sh - panel.barH - h - gap
+    else if (pos === "left") x = panel.barW + gap
+    else x = sw - panel.barW - w - gap
+
+    var extent = verticalBar ? sh : sw
+    var centre = verticalBar
+      ? panel.anchorScreenPos.y + panel.anchorH / 2
+      : panel.anchorScreenPos.x + panel.anchorW / 2
+    var half = extent / 2
+    var deadzone = extent * 0.12
+
+    if (centre > half + deadzone) {
+      if (verticalBar) y = sh - h - m
+      else x = sw - w - m
+    } else if (centre < half - deadzone) {
+      if (verticalBar) y = m
+      else x = m
+    } else if (verticalBar) {
+      y = panel.anchorScreenPos.y + panel.anchorH / 2 - h / 2
+    } else {
+      x = panel.anchorScreenPos.x + panel.anchorW / 2 - w / 2
+    }
+
+    x = Math.max(m, Math.min(x, sw - w - m))
+    y = Math.max(m, Math.min(y, sh - h - m))
+    return Qt.point(Math.round(x), Math.round(y))
+  }
+
+  Binding {
+    target: root.card
+    property: "x"
+    value: root.cardOrigin().x
+    when: root.card !== null
+    restoreMode: Binding.RestoreBindingOrValue
+  }
+
+  Binding {
+    target: root.card
+    property: "y"
+    value: root.cardOrigin().y
+    when: root.card !== null
+    restoreMode: Binding.RestoreBindingOrValue
+  }
+
   function open() {
     openedFromHotkey = false
     setCenterHoverRevealSuppressed(false)
@@ -931,7 +1018,10 @@ Panel {
     owner: root.barIdentity
     bar: root.bar
     open: root.opened
-    centerOnBar: true
+    // Placement is overridden by the card x/y Bindings above. This stays false
+    // so that if root.card ever fails to resolve, the shell's fallback is
+    // icon-centred rather than screen-centred.
+    centerOnBar: false
     focusTarget: keyCatcher
     contentWidth: panel.fittedContentWidth(Style.space(400))
     contentHeight: panel.fittedContentHeight(routerColumn.implicitHeight, Style.space(520))

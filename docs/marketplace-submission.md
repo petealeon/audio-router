@@ -1,26 +1,23 @@
 # Marketplace submission — petealeon.router
 
-Draft for the Omarchy plugin marketplace (plugins.omarchy.org). Fill in the
-repository URL once the repo is named and pushed, then paste into the
+Draft for the Omarchy plugin marketplace (plugins.omarchy.org). Paste into the
 [submit form](https://plugins.omarchy.org/publish).
 
 ## Checklist (all must be true before submitting)
 
-- [ ] Repository is **public** on GitHub
-- [ ] `manifest.json` is at the repository root and passes `omarchy plugin validate`
-- [ ] `scripts/check-manifest.py` passes (run: `python3 scripts/check-manifest.py`)
-- [ ] README and LICENSE (MIT) are at the repository root
-- [ ] `selftest` passes: `python3 assets/omarchy-router selftest`
-- [ ] Install/removal is safe: `install.sh` gains `--remove`/`--purge`
-- [ ] No symlinks in the repository; no secrets; ID not in the `omarchy.*` namespace
-- [ ] The commit being submitted is tagged (`v1.3.0`) and pushed
+- [x] Repository is **public** on GitHub
+- [x] `manifest.json` is at the repository root and passes `omarchy plugin validate`
+- [x] `scripts/check-manifest.py` passes (run: `python3 scripts/check-manifest.py`)
+- [x] README and LICENSE (MIT) are at the repository root
+- [x] `selftest` passes: `python3 assets/omarchy-router selftest`
+- [x] Install/removal is safe: `install.sh` gains `--remove`/`--purge`
+- [x] No symlinks in the repository; no secrets; ID not in the `omarchy.*` namespace
+- [x] The commit being submitted is tagged (`v1.3.0`) and pushed
 
 ## Suggested listing
 
-**Repository URL:** not created yet — this repo is local-only (no git remote).
-Intended name `petealeon/audio-router`; create it and confirm the name before
-submitting, then paste the real URL into the
-[submit form](https://plugins.omarchy.org/publish).
+**Repository URL:** https://github.com/petealeon/audio-router
+Paste it into the [submit form](https://plugins.omarchy.org/publish).
 
 **Category:** Sound & Audio
 

@@ -50,11 +50,12 @@ tagged `vX.Y.Z`.
   directory, the bar entry and the Quickshell module name, so a plain rename
   would have left the old copy registered and the widget on the bar twice;
   `install.sh` now migrates it — it stops the old watcher, unregisters
-  `peter.router`, strips its stale bar entry from `shell.json` and removes the
-  old directory, while leaving `~/.config/omarchy/router-rules.json` intact. Both
-  the install and the `--remove`/`--purge` paths run the migration, so no manual
-  step is needed. Upgrading installs `petealeon.router` in the same right-hand
-  bar section.
+  `peter.router` (which also drops its bar entry) and removes the old directory,
+  while leaving `~/.config/omarchy/router-rules.json` intact. A stale bar entry
+  is additionally swept from `shell.json` as a safety net, though `omarchy
+  plugin remove` was observed to clean that up on its own. Both the install and
+  the `--remove`/`--purge` paths run the migration, so no manual step is needed.
+  Upgrading installs `petealeon.router` in the same right-hand bar section.
 - System binaries (`quickshell`, `wireplumber`, `pipewire`, `systemd`, `pactl`,
   `pw-dump`, portals, …) are now excluded from steering in the helper itself,
   not just in the panel's row model.
@@ -73,8 +74,17 @@ tagged `vX.Y.Z`.
   superseded by the routing switch.
 
 ### Fixed
-- A latent `NameError` in the helper's `set-sink` path, which the new
-  `set-rule`/`set-sink` selftest coverage now exercises for the first time.
+- **The panel opened in the middle of the bar instead of at its own corner.**
+  It was placed with `centerOnBar: true`, which centres the card on the screen,
+  so a widget at the end of a section still got a screen-centred panel. It now
+  sits flush with the screen corner belonging to the bar section it lives in —
+  the right end for `right`, the bottom end when the bar is on the side — and
+  the corner is re-derived from the widget's live position, so moving the entry
+  to another section moves the panel with it. A centre-section widget stays
+  icon-centred, where "flush" has no meaningful answer.
+- A `NameError` in the helper's `set-sink` path, introduced while splitting
+  `set-rule` out of `set-sink` in this release and caught by the new
+  `set-rule`/`set-sink` selftest coverage before it shipped.
 - The CI QML lint step never actually ran. It gated on `command -v qmllint`,
   but `qmllint` is not on `PATH` on the distros that ship it, and it passed no
   import path, so `qs.Ui`/`qs.Commons` could not have resolved. It now installs

@@ -105,6 +105,7 @@ Panel {
   function watchColor() {
     if (!root.hostWidget) return root.textColor
     if (root.hostWidget.watchDead) return Qt.rgba(0.88, 0.2, 0.2, 1)
+    if (!root.hostWidget.watchAlive) return Qt.rgba(0.45, 0.48, 0.55, 1)
     if (root.hostWidget.watchRestarts > 0) return Qt.rgba(0.9, 0.66, 0.24, 1)
     return Qt.rgba(0.34, 0.78, 0.42, 1)
   }
@@ -112,6 +113,7 @@ Panel {
   function watchStatusText() {
     if (!root.hostWidget) return "watch"
     if (root.hostWidget.watchDead) return "dead"
+    if (!root.hostWidget.watchAlive) return "stopped"
     if (root.hostWidget.watchRestarts > 0) return "restart " + root.hostWidget.watchRestarts
     return "alive"
   }
@@ -811,6 +813,7 @@ Panel {
           id: watchStatus
           width: root.watchStatusWidth
           height: root.rowH
+          property bool watchHovered: false
 
           Rectangle {
             id: statusDot
@@ -842,12 +845,14 @@ Panel {
             id: watchStatusMouse
             anchors.fill: parent
             hoverEnabled: true
+            onEntered: watchStatus.watchHovered = true
+            onExited: watchStatus.watchHovered = false
             onClicked: {
               if (root.hostWidget && root.hostWidget.restartWatcher) root.hostWidget.restartWatcher()
             }
           }
 
-          ToolTip.visible: watchStatusMouse.hovered
+          ToolTip.visible: watchStatus.watchHovered
           ToolTip.text: root.watchTooltip()
           ToolTip.delay: 400
         }

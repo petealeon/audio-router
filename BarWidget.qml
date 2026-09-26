@@ -18,6 +18,7 @@ BarWidget {
   property bool watchAlive: false
   property bool watchDead: false
   property int _suppressExit: 0
+  property int _flockRetries: 0
 
   function logEvent(msg) {
     console.log("[peter.router] " + msg)
@@ -26,6 +27,7 @@ BarWidget {
   function restartWatcher() {
     root.watchRestarts = 0
     root.watchDead = false
+    root._flockRetries = 0
     root._suppressExit += 1
     root.logEvent("watcher restart requested by user")
     watchProc.running = false
@@ -91,6 +93,7 @@ BarWidget {
     onStarted: {
       root.watchAlive = true
       root.watchPid = watchProc.processId || 0
+      root._flockRetries = 0
       root.logEvent("watcher started pid=" + root.watchPid)
     }
 
@@ -104,9 +107,16 @@ BarWidget {
       }
       if (root.watchDead) return
       if (exitCode === 3) {
-        // Intentional watcher exit: another watcher holds the flock, or the
-        // parent disappeared. Nothing to heal.
-        root.logEvent("watcher stopped intentionally (code 3)")
+        // Intentional watcher exit — normally another watcher holding the
+        // flock. That clears within ~0.5s of a shell reload (the old watcher
+        // sees its parent die), so retry once before giving up.
+        if (root._flockRetries < 1) {
+          root._flockRetries += 1
+          root.logEvent("watcher exited (code 3); another watcher may hold the flock — retrying in 3s")
+          watchRetry.restart()
+        } else {
+          root.logEvent("watcher exited (code 3); another watcher appears to hold the flock — click the health dot to force a restart")
+        }
         return
       }
       if (root.watchRestarts >= 5) {
@@ -118,17 +128,17 @@ BarWidget {
       root.logEvent("watcher crashed (code=" + exitCode + "), restarting (" + root.watchRestarts + "/5) in 3s")
       watchRetry.restart()
     }
+  }
 
-    Timer {
-      id: watchRetry
-      interval: 3000
-      running: false
-      onTriggered: {
-        if (root.watchDead) return
-        root._suppressExit += 1
-        watchProc.running = false
-        watchProc.running = true
-      }
+  Timer {
+    id: watchRetry
+    interval: 3000
+    running: false
+    onTriggered: {
+      if (root.watchDead) return
+      root._suppressExit += 1
+      watchProc.running = false
+      watchProc.running = true
     }
   }
 

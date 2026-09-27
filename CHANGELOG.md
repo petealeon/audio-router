@@ -3,6 +3,40 @@
 All notable changes to `petealeon.router` are documented here. SemVer; releases are
 tagged `vX.Y.Z`.
 
+## [1.3.1] - 2026-09-27
+
+### Fixed
+- **Turning routing off now actually reverts the audio.** The revert is run only
+  once the watcher is confirmed gone, instead of racing it: previously `restore`
+  was fired while the watcher was still dying, and the dying watcher could win
+  and re-pin a stream after the revert had already moved it. The switch then
+  read "off" with the app still on its pinned output, with nothing indicating
+  anything had gone wrong. The revert is now started from the watcher's exit
+  (with a bounded 1.5s backstop and the helper's own 5s lock wait behind it), and
+  saved rules are still left untouched so switching back on re-pins the same
+  apps.
+- **A failed revert is no longer silent.** The revert ran through
+  `execDetached`, which discards stdout and stderr, so a failure and a clean
+  revert were indistinguishable — and the switch reported success either way. It
+  is now a managed process whose result the panel reads, and the helper re-reads
+  the stream list afterwards to confirm every valid stream actually reached
+  `pactl get-default-sink` instead of trusting the moves it issued. Failures are
+  reported in the panel ("routing off — some apps are still routed: …") rather
+  than being swallowed. The helper also reports the outcome on stdout as
+  `RESTORE_RESULT`, because Quickshell does not reliably deliver `onExited` for
+  clean non-zero exits — exactly the shape of a failed revert.
+- **Routing off survives a shell reload.** The switch only lived in a widget
+  property, so any shell or plugin restart re-enabled routing with no visible
+  indication. The intent is now persisted in
+  `~/.config/omarchy/petealeon-router.json` and read before the watcher is
+  started; a missing or unreadable file means on. The watcher is no longer
+  started speculatively and then torn down for anyone who had routing off.
+- **`restore` no longer looks successful when it did nothing.** It waited 2s for
+  the watch lock, silently moved zero streams if `pactl` could not report a
+  default sink, and gave up on any stream that did not follow. It now waits up to
+  5s for the lock, fails loudly if `pactl` is unusable, and exits non-zero
+  listing the apps that stayed routed.
+
 ## [1.3.0] - 2026-09-26
 
 ### Added

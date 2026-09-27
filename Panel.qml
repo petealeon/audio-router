@@ -177,6 +177,11 @@ Panel {
   // back on resets the budget.
   readonly property bool routingOn: root.hostWidget ? (root.hostWidget.watchEnabled && root.hostWidget.watchAlive) : false
   readonly property string toggleHint: root.routingOn ? "Turn routing off" : "Turn routing on"
+  // Proxied from the host widget, which owns the revert: non-empty when moving
+  // streams back to the default sink did not fully take. Routing can be off
+  // (watcher stopped, switch showing off) while this is set, which is the
+  // combination that used to be reported as a clean success.
+  readonly property string restoreError: root.hostWidget ? String(root.hostWidget.restoreError || "") : ""
 
   // Omarchy theme roles: accent = "your routes" highlight, foreground =
   // system routes (neutral). Both re-evaluate live when the theme swaps.
@@ -1118,19 +1123,24 @@ Panel {
 
       // Degraded pactl beats the "routing off" note — an unreadable pactl
       // means routing cannot work at all, regardless of the switch position.
+      // A failed revert outranks both: the switch says off while audio is
+      // still pinned, and saying "edits kept, applied when switched on" there
+      // would be a lie about the current state.
       Text {
         id: statusNote
         width: parent.width
-        visible: root.stateError !== "" || !root.routingOn
+        visible: root.stateError !== "" || root.restoreError !== "" || !root.routingOn
         font.pixelSize: Style.font.caption
         font.family: root.bar ? root.bar.fontFamily : Style.font.family
-        color: root.stateError !== "" ? Qt.rgba(0.85, 0.66, 0.24, 1) : root.textColor
-        opacity: root.stateError !== "" ? 1.0 : 0.6
+        color: root.stateError !== "" || root.restoreError !== "" ? Qt.rgba(0.85, 0.66, 0.24, 1) : root.textColor
+        opacity: root.stateError !== "" || root.restoreError !== "" ? 1.0 : 0.6
         horizontalAlignment: Text.AlignHCenter
         wrapMode: Text.WordWrap
         text: root.stateError !== ""
           ? "routing unavailable — " + root.stateError
-          : "routing off — edits kept, applied when switched on"
+          : root.restoreError !== ""
+            ? "routing off — some apps are still routed: " + root.restoreError
+            : "routing off — edits kept, applied when switched on"
       }
 
       PanelSeparator {

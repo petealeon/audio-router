@@ -7,14 +7,16 @@ import qs.Ui
 BarWidget {
   id: root
   moduleName: "petealeon.router"
-  property string version: "1.3.0"
+  property string version: "1.3.1"
 
   // Watcher health, surfaced to Panel.qml through the injected hostWidget
   // reference. A crashed watcher loses rule re-assertion silently, so the
   // Process below self-heals (bounded) and these properties drive the panel's
   // on/off switch.
   // `watchEnabled` is the user's intent: when false the watcher is stopped and
-  // nothing re-arms it, so apps fall through to the system default routing.
+  // nothing re-arms it, so apps fall through to the system default routing. It
+  // is persisted, because a shell reload otherwise restarted the watcher and
+  // silently switched routing back on behind the user's back.
   // `watchAlive` is the observed state; the panel's switch reflects the
   // conjunction so a watcher that died (crash budget exhausted, still enabled)
   // reads as `off`.
@@ -26,6 +28,16 @@ BarWidget {
   property bool _stopping: false
   property int _flockRetries: 0
   property int _lastExit: 0
+  // Set when the user moves the switch. The persisted state is read a few
+  // milliseconds after load, and must not overwrite a toggle that happened in
+  // the meantime (panel opened and switched immediately) — nor be cancelled
+  // mid-read, which would leave the watcher unstarted.
+  property bool _toggleRequested: false
+  // Non-empty when the last revert to the default sink did not fully take.
+  // Surfaced by Panel.qml, because a switch reading "off" while audio is still
+  // pinned is exactly the failure this exists to make visible.
+  property string restoreError: ""
+  property bool _restoreDone: false
 
   function logEvent(msg) {
     console.log("[petealeon.router] " + msg)
@@ -47,7 +59,12 @@ BarWidget {
   // streams use the system default. On resumes rule re-assertion, resetting
   // any crash-restart budget a dead watcher may have exhausted.
   function setWatchEnabled(on) {
+    root._toggleRequested = true
     root.watchEnabled = on
+    root.restoreError = ""
+    // Persist the intent first: a crash or reload between here and the outcome
+    // should still come back with the switch where the user left it.
+    root.persistRouting(on)
     if (on) {
       root.watchRestarts = 0
       root.watchDead = false
@@ -58,17 +75,61 @@ BarWidget {
       watchProc.running = true
     } else {
       root.watchAlive = false
+      root._restoreDone = false
       root.logEvent("watcher disabled by user")
       root._stopping = true
       watchProc.running = false
       // "Routing off" must mean "everything back on the system default",
       // not just "stop re-asserting": streams already moved onto a pinned
-      // output would otherwise stay there indefinitely. The helper's `restore`
-      // flocks the watch lock (so the dying watcher cannot re-assert mid-move)
-      // and puts every valid stream back on `pactl get-default-sink`. Saved
-      // rules are untouched, so switching back on re-pins the same apps.
-      Quickshell.execDetached(["python3", root.helperPath(), "restore"])
+      // output would otherwise stay there indefinitely. Saved rules are
+      // untouched, so switching back on re-pins the same apps.
+      //
+      // The revert is deliberately NOT fired here. It waits for the watcher to
+      // actually be gone (see _processExit, with restoreFallback as a backstop)
+      // because starting it while the watcher is still dying let the dying
+      // process win the race and re-pin a stream after the restore had moved
+      // it — which is how the switch came to read "off" with audio still routed.
+      // The helper also flocks the watch lock, so only one of the two can
+      // proceed; sequencing here just avoids depending on that lock alone.
+      restoreFallback.restart()
     }
+  }
+
+  // Runs the revert and parses the helper's machine-readable result. A managed
+  // Process, not execDetached: the old detached call discarded both stdout and
+  // stderr, so a failed revert was indistinguishable from a successful one and
+  // the switch reported success either way.
+  function beginRestore() {
+    if (root._restoreDone || root.watchEnabled) return
+    root._restoreDone = true
+    if (!restoreProc.running) restoreProc.running = true
+  }
+
+  // RESTORE_RESULT <status> <detail>, emitted on stdout by `restore`. Parsed
+  // from the collected stream rather than from an exit code, because Quickshell
+  // does not reliably deliver onExited for clean non-zero exits — exactly the
+  // shape of a failed revert.
+  function applyRestoreResult(text) {
+    var line = String(text || "").trim()
+    if (line.indexOf("RESTORE_RESULT") !== 0) return
+    var parts = line.split(/\s+/)
+    var status = parts[1] || ""
+    var detail = parts.slice(2).join(" ")
+    if (status === "ok") {
+      root.restoreError = ""
+      root.logEvent("restore ok: " + detail)
+    } else {
+      root.restoreError = detail || "revert to default sink failed"
+      root.logEvent("restore FAILED: " + root.restoreError)
+    }
+  }
+
+  function persistRouting(on) {
+    // Deliberately does not touch stateProc: cancelling a waitForEnd collector
+    // mid-read would mean its result never arrives, and the branch that starts
+    // the watcher never runs. A stale read is handled by _toggleRequested.
+    if (on) routingOnProc.running = true
+    else routingOffProc.running = true
   }
 
   function injectPanel() {
@@ -131,7 +192,10 @@ BarWidget {
   // here. onExited remains as a de-duplicated fallback for signal deaths.
   Process {
     id: watchProc
-    running: true
+    // Started from the routing-state read, not here: with the persisted intent
+    // still unknown, running unconditionally would spawn a watcher and then
+    // tear it down moments later for anyone who had routing off.
+    running: false
     command: ["python3", root.helperPath(), "watch"]
 
     stderr: StdioCollector {
@@ -163,6 +227,92 @@ BarWidget {
     }
   }
 
+  // Reads the persisted on/off intent. Runs before the watcher is started, so a
+  // fresh shell or a plugin reload no longer quietly re-enables routing.
+  Process {
+    id: stateProc
+    running: true
+    command: ["python3", root.helperPath(), "routing-state"]
+
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var want = String(text || "").trim()
+        if (root._toggleRequested) {
+          // The switch was already moved while this read was in flight, so the
+          // user's action is the newer intent; do not let the file override it.
+          root.logEvent("routing state read ignored: switch already toggled")
+          return
+        }
+        root.watchEnabled = (want !== "off")
+        root.logEvent("routing state read: " + (want === "off" ? "off" : want === "on" ? "on" : "on (unrecognised, defaulting)"))
+        if (root.watchEnabled) {
+          root._stopping = true
+          watchProc.running = true
+        } else {
+          // Coming back from a reload with routing off. Nothing is pinned, so
+          // there is nothing to revert; just make sure no watcher sneaks up.
+          root.logEvent("routing is off; watcher not started")
+        }
+      }
+    }
+  }
+
+  Process {
+    id: restoreProc
+    running: false
+    command: ["python3", root.helperPath(), "restore"]
+
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.applyRestoreResult(text)
+    }
+
+    stderr: StdioCollector {
+      onStreamFinished: {
+        var msg = String(text || "").trim()
+        if (msg !== "") root.logEvent("restore: " + msg)
+      }
+    }
+  }
+
+  // Preference writes. Separate processes rather than one reused instance so a
+  // rapid on/off/on cannot cancel the write it just issued.
+  Process {
+    id: routingOnProc
+    running: false
+    command: ["python3", root.helperPath(), "set-routing", "on"]
+    stderr: StdioCollector {
+      onStreamFinished: {
+        var msg = String(text || "").trim()
+        if (msg !== "") root.logEvent("set-routing: " + msg)
+      }
+    }
+  }
+
+  Process {
+    id: routingOffProc
+    running: false
+    command: ["python3", root.helperPath(), "set-routing", "off"]
+    stderr: StdioCollector {
+      onStreamFinished: {
+        var msg = String(text || "").trim()
+        if (msg !== "") root.logEvent("set-routing: " + msg)
+      }
+    }
+  }
+
+  Timer {
+    id: restoreFallback
+    // Backstop only: _processExit normally starts the revert the moment the
+    // watcher is confirmed gone. If that notice never arrives, the helper's own
+    // flock wait (5s, bounded) is the real authority, so waiting longer than
+    // this gains nothing.
+    interval: 1500
+    running: false
+    onTriggered: root.beginRestore()
+  }
+
   // Single dispatch point for watcher death. Two channels feed it — the helper
   // prints a __WATCH_EXIT marker on stderr (collected via onStreamFinished,
   // reliably delivered even when quickshell drops onExited for a clean
@@ -171,7 +321,13 @@ BarWidget {
   // 200ms de-dup window covers the double-firing case since consecutive
   // watcher exits are always seconds apart.
   function _processExit(reason, code) {
-    if (!root.watchEnabled) return
+    if (!root.watchEnabled) {
+      // Routing was just switched off and the watcher is now gone, so it can no
+      // longer re-assert a pin. Only now is the revert safe to run.
+      root._stopping = false
+      root.beginRestore()
+      return
+    }
     if (root._stopping) {
       root._stopping = false
       return

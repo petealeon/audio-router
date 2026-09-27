@@ -7,6 +7,11 @@ Subcommands:
                              persist a rule (removes it when sink is
                              __default__) and move matching active streams now
   remove <app-or-binary>     delete a rule and move matching streams to default
+  restore                    move every valid stream back to the default sink;
+                             non-zero exit if any stream fails to follow
+  routing-state              print the persisted on/off intent ("on" or "off")
+  set-routing <on|off>       persist that intent, so a shell reload does not
+                             silently switch routing back on
   watch                      apply persisted rules on a 0.5s poll; exits when
                              the parent that spawned it is gone; flock-singleton
   selftest                   run the pure-function checks below (no pactl, no store)
@@ -21,6 +26,10 @@ State is stored at ~/.config/omarchy/router-rules.json:
       "sink": "alsa_output.pci-..." }, ...]
 sink values are output NAMES (__default__ is never persisted).
 
+The on/off switch is stored separately at ~/.config/omarchy/petealeon-router.json
+as {"routing_enabled": true|false}, because it is a preference that has to
+survive a shell reload. Missing or unreadable means on.
+
 A rule stores whichever identity fields were visible at link time; streams are
 matched in order of specificity: process-binary basename, then PipeWire
 node.name basename, then application.name (trailing " input" ignored). Browser
@@ -33,12 +42,14 @@ can never drop each other's rule.
 """
 
 import fcntl
+import io
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 RUNTIME = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
@@ -46,6 +57,10 @@ STORE = os.environ.get("ROUTER_STORE") or f"{os.path.expanduser('~')}/.config/om
 LOCK = f"{RUNTIME}/omarchy-router.store.lock"
 WATCH_MARK = f"{RUNTIME}/omarchy-router.watch.lock"
 LOG = f"{RUNTIME}/omarchy-router.watch.log"
+# Routing on/off is a user preference, not derived state: it has to outlive the
+# shell, because a reload otherwise silently switches routing back on. Lives
+# beside the rule store in the config dir the plugin already owns.
+STATE = os.environ.get("ROUTER_STATE") or f"{os.path.expanduser('~')}/.config/omarchy/petealeon-router.json"
 
 # Exit codes that mean "intentional stop" rather than a crash. Shared contract
 # with BarWidget.qml onExited: 0 = clean self-exit, 3 = flock conflict or parent
@@ -413,44 +428,131 @@ def replace_rule(rules, app, binary, node, sink):
     return kept
 
 
+def acquire_watch_lock(retries=25, delay=0.2):
+    """Take the watcher's flock, or return None.
+
+    The watcher releases it the instant it dies (the kernel drops flocks when
+    the fd closes), so this normally succeeds on the first try once the watcher
+    is gone. It is polled rather than blocked on so a still-running watcher
+    cannot hang the caller forever, and so the caller can report the failure
+    instead of appearing to succeed.
+    """
+    try:
+        mark = open(WATCH_MARK, "w")
+    except OSError:
+        return None
+    for _ in range(retries):
+        try:
+            fcntl.flock(mark, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return mark
+        except OSError:
+            time.sleep(delay)
+    mark.close()
+    return None
+
+
+def restore_result(status, detail=""):
+    # Machine-readable summary on stdout. The widget cannot rely on
+    # Process.onExited to learn the outcome: Quickshell drops that signal for
+    # clean non-zero exits, which is exactly the shape of a failed revert. A
+    # token in the collected stdout always arrives, so the off-switch can be
+    # driven from this instead of from an exit code that may never be seen.
+    sys.stdout.write(f"RESTORE_RESULT {status}{(' ' + detail) if detail else ''}\n")
+    sys.stdout.flush()
+
+
 def cmd_restore():
     # Restore all valid sink inputs to the system default sink, without touching
     # the stored rules. Flock the watch lock (bounded) so the watcher cannot
     # concurrently re-assert pins while we're moving streams.
+    #
+    # This is the whole off-switch, so it must never look successful when it
+    # did not: the widget drives its switch from this result, and "moved 0"
+    # used to be indistinguishable from a clean revert. Every failure path here
+    # is an error result, and the final state is re-read and checked rather than
+    # assumed.
+    mark = acquire_watch_lock()
+    if mark is None:
+        restore_result("error", "watcher still running")
+        say_exit("restore: could not acquire watch lock — is the watcher still running?", "flock")
+        sys.exit(3)
     try:
-        mark = open(WATCH_MARK, "w")
-    except OSError:
-        mark = None
-    try:
-        if mark is not None:
-            for _ in range(10):
-                try:
-                    fcntl.flock(mark, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    break
-                except OSError:
-                    time.sleep(0.2)
-            else:
-                say_exit("restore: could not acquire watch lock", "flock")
-                sys.exit(3)
+        default = run(["pactl", "get-default-sink"]).strip()
+        if not default:
+            restore_result("error", "no default sink")
+            say_exit("restore: pactl could not report a default sink", "pactl")
+            sys.exit(5)
         sinks = parse_sinks(run(["pactl", "list", "sinks"]))
         sink_by_index = {s["index"]: s for s in sinks}
         inputs = [e for e in parse_inputs(run(["pactl", "list", "sink-inputs"]), sink_by_index) if is_valid_input(e)]
-        default = run(["pactl", "get-default-sink"]).strip() or ""
         moved = 0
-        if default:
-            for e in inputs:
-                if e["sinkName"] == default:
-                    continue
-                move(e["id"], default)
-                moved += 1
-        say(f"restore: moved {moved} to default")
+        for e in inputs:
+            if e["sinkName"] == default:
+                continue
+            move(e["id"], default)
+            moved += 1
+        # Re-read rather than trust the moves: a stream can disappear, or the
+        # move can be refused, between the call above and this check.
+        after = parse_inputs(run(["pactl", "list", "sink-inputs"]), sink_by_index)
+        stuck = [e for e in after if is_valid_input(e) and e["sinkName"] != default]
+        if stuck:
+            names = ", ".join(sorted({e.get("appName") or e.get("binary") or "?" for e in stuck}))
+            restore_result("error", f"{len(stuck)} still routed")
+            say_exit(f"restore: streams did not return to the default sink: {names}", "stuck")
+            sys.exit(4)
+        restore_result("ok", f"moved {moved} of {len(inputs)} to {default}")
+        say(f"restore: moved {moved} of {len(inputs)} to {default}")
     finally:
-        if mark is not None:
-            try:
-                fcntl.flock(mark, fcntl.LOCK_UN)
-            except OSError:
-                pass
-            mark.close()
+        try:
+            fcntl.flock(mark, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        mark.close()
+
+
+def load_routing_state():
+    """Persisted on/off intent. Absent or unreadable means on: routing is the
+    default, and a corrupt preference file must not silently disable the
+    plugin."""
+    try:
+        with open(STATE, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+    except (OSError, ValueError):
+        return True
+    return bool(obj.get("routing_enabled", True))
+
+
+def cmd_routing_state():
+    print("on" if load_routing_state() else "off")
+
+
+def cmd_set_routing(value):
+    want = str(value).strip().lower()
+    if want not in ("on", "off"):
+        say(f"set-routing: expected 'on' or 'off', got {value!r}")
+        sys.stdout.write("ROUTING_STATE error bad value\n")
+        sys.stdout.flush()
+        sys.exit(2)
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    tmp = f"{STATE}.tmp.{os.getpid()}"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"routing_enabled": want == "on"}, f, indent=2)
+            f.write("\n")
+        os.replace(tmp, STATE)
+    except OSError as ex:
+        say(f"set-routing: could not write {STATE}: {ex}")
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        sys.stdout.write("ROUTING_STATE error could not write\n")
+        sys.stdout.flush()
+        sys.exit(1)
+    say(f"set-routing: routing {want}")
+    sys.stdout.write(f"ROUTING_STATE {want}\n")
+    sys.stdout.flush()
+
 
 
 def cmd_set(app, binary, node, sink_name, move=True):
@@ -736,6 +838,54 @@ def selftest():
     finally:
         modify_store, move_matching, run = real_modify_store, real_move_matching, real_run
 
+    # Routing on/off persistence. Redirected to a temp file via the module
+    # global so the real preference is never touched, and so "absent means on"
+    # is checked as a first-class case rather than assumed.
+    real_state = STATE
+    tmp_state = f"{os.path.realpath(tempfile.gettempdir())}/omarchy-router.selftest.{os.getpid()}.json"
+    try:
+        globals()["STATE"] = tmp_state
+        try:
+            os.unlink(tmp_state)
+        except OSError:
+            pass
+
+        check("routing-state: absent file means on", load_routing_state(), True)
+
+        cmd_set_routing("off")
+        check("set-routing: wrote the file", os.path.exists(tmp_state), True)
+        check("routing-state: persisted off", load_routing_state(), False)
+
+        cmd_set_routing("on")
+        check("routing-state: persisted on", load_routing_state(), True)
+
+        with open(tmp_state, "w", encoding="utf-8") as f:
+            f.write("{not json")
+        check("routing-state: corrupt file falls back to on", load_routing_state(), True)
+
+        with open(tmp_state, "w", encoding="utf-8") as f:
+            json.dump({"something_else": 1}, f)
+        check("routing-state: missing key falls back to on", load_routing_state(), True)
+
+        real_stdout = sys.stdout
+        try:
+            # Swallow the token/say output: this check is about the exit code,
+            # and letting the messages through would interleave with the report.
+            sys.stdout = io.StringIO()
+            try:
+                cmd_set_routing("maybe")
+                check("set-routing: rejects a bad value", "no exit", "SystemExit")
+            except SystemExit as ex:
+                check("set-routing: rejects a bad value", ex.code, 2)
+        finally:
+            sys.stdout = real_stdout
+    finally:
+        globals()["STATE"] = real_state
+        try:
+            os.unlink(tmp_state)
+        except OSError:
+            pass
+
     failed = [name for name, ok in checks if not ok]
     print(f"selftest: {len(checks) - len(failed)}/{len(checks)} passed")
     return 1 if failed else 0
@@ -746,7 +896,8 @@ def main():
     if not args:
         say("usage: omarchy-router list | set-sink <app> <binary> <node> <sink|__default__>"
             " | set-rule <app> <binary> <node> <sink|__default__>"
-            " | remove <app-or-binary> | restore | watch | selftest")
+            " | remove <app-or-binary> | restore | routing-state | set-routing <on|off>"
+            " | watch | selftest")
         sys.exit(2)
     cmd, rest = args[0], args[1:]
     if cmd == "list":
@@ -759,6 +910,10 @@ def main():
         cmd_remove(rest[0])
     elif cmd == "restore":
         cmd_restore()
+    elif cmd == "routing-state":
+        cmd_routing_state()
+    elif cmd == "set-routing" and rest:
+        cmd_set_routing(rest[0])
     elif cmd == "watch":
         cmd_watch()
     elif cmd == "selftest":

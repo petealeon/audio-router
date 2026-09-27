@@ -4,13 +4,16 @@
 # Usage:
 #   ./install.sh            install + enable the widget
 #   ./install.sh --remove   uninstall (keeps the routing rules in
-#                           ~/.config/omarchy/router-rules.json)
-#   ./install.sh --purge    uninstall and delete the routing rules
+#                           ~/.config/omarchy/router-rules.json and the on/off
+#                           preference in ~/.config/omarchy/petealeon-router.json)
+#   ./install.sh --purge    uninstall and delete both of those
 #
 # The plugin is the two-column audio patchbay: a dedicated bar icon opens a
 # panel where any app can be dragged onto (or click-clicked into) any output.
 # Pinned routes are persisted in ~/.config/omarchy/router-rules.json and
-# reasserted by a self-healing watcher.
+# reasserted by a self-healing watcher. The routing on/off switch is persisted
+# separately in ~/.config/omarchy/petealeon-router.json so a shell reload does
+# not silently switch routing back on.
 
 set -euo pipefail
 
@@ -30,8 +33,9 @@ have() { command -v "$1" >/dev/null 2>&1; }
 
 # Unregister a superseded id: stop its watcher (anchored to that install path so
 # it can never match an unrelated process), drop the plugin, strip its bar entry,
-# then remove any leftover directory. Routing rules live in
-# ~/.config/omarchy/router-rules.json and are deliberately untouched — only
+# then remove any leftover directory. Routing rules
+# (~/.config/omarchy/router-rules.json) and the on/off preference
+# (~/.config/omarchy/petealeon-router.json) are deliberately untouched — only
 # --purge deletes those.
 drop_legacy() {
   local legacy dest
@@ -84,8 +88,12 @@ remove() {
     omarchy restart shell
   fi
   if (( purge )); then
-    rm -f "${HOME}/.config/omarchy/router-rules.json"
-    echo "Purged routing rules."
+    # Purging the on/off preference too: it is plugin state, not a pinned
+    # route, so leaving it behind would make a later reinstall start with
+    # routing off for no visible reason.
+    rm -f "${HOME}/.config/omarchy/router-rules.json" \
+          "${HOME}/.config/omarchy/petealeon-router.json"
+    echo "Purged routing rules and routing state."
   fi
   # Also clear any superseded id, so removing after the rename is a clean sweep
   # rather than leaving an orphan behind.

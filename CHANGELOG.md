@@ -6,6 +6,20 @@ tagged `vX.Y.Z`.
 ## [1.3.1] - 2026-09-27
 
 ### Fixed
+- **An app no longer appears twice while it is playing.** When PipeWire reports
+  a process's binary with its ` (deleted)` artifact — which it does after the
+  executable is replaced under a running process, as happens when Brave updates
+  itself — the live stream keyed as `brave (deleted)` while the same app's
+  client and its stored rule keyed as `brave`. The panel's identity key is
+  first-non-empty-field-wins, so the rule failed to find the live row and
+  created a second one with no streams: Brave showed a row with a playing icon
+  and a row without, collapsing back to one on stop. The artifact is now
+  stripped from identity and label fields, in `assets/omarchy-router` (so it can
+  never be written into the rule store) and in `Model.js` (which also covers a
+  rule already saved with it). The same mismatch had been quietly weakening rule
+  matching: Brave's rule was only landing via its PipeWire node name, so a stream
+  without one would have missed its rule and fallen back to the default output
+  without saying so.
 - **Turning routing off now actually reverts the audio.** The revert is run only
   once the watcher is confirmed gone, instead of racing it: previously `restore`
   was fired while the watcher was still dying, and the dying watcher could win
@@ -36,6 +50,15 @@ tagged `vX.Y.Z`.
   default sink, and gave up on any stream that did not follow. It now waits up to
   5s for the lock, fails loudly if `pactl` is unusable, and exits non-zero
   listing the apps that stayed routed.
+
+### Added
+- **`scripts/model-test.js`, wired into CI.** The identity helpers in `Model.js`
+  decide which panel entries are the same app, and until now nothing tested
+  them — the Python selftest cannot reach them, which is why the duplicate-row
+  bug could ship. The test loads `Model.js` the way QML does and asserts the
+  ` (deleted)` normalisation, the stream/client/rule agreement that produces a
+  single row, and that key precedence still falls back binary → node name →
+  application name.
 
 ## [1.3.0] - 2026-09-26
 

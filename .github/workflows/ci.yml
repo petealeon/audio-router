@@ -11,8 +11,18 @@ jobs:
         with:
           python-version: "3.12"
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
       - name: Helper selftest
         run: python3 assets/omarchy-router selftest
+
+      - name: Model test
+        # The panel's identity helpers are only reachable from QML, so the
+        # Python selftest above cannot cover them. This is where the duplicate
+        # Brave rows came from.
+        run: node scripts/model-test.js
 
       - name: Installer syntax
         run: bash -n install.sh

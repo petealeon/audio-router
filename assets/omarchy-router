@@ -102,8 +102,27 @@ def run(cmd, timeout=4):
         return ""
 
 
+def strip_deleted(s):
+    """Drop PipeWire's " (deleted)" artifact from an identity string.
+
+    When a process's on-disk executable is replaced under it (a browser
+    updating itself, a package upgrade), PipeWire reports the binary as
+    "brave (deleted)". That string is not a binary name, and letting it through
+    splits one app into two identities: the live stream keys on
+    "brave (deleted)" while the client and the stored rule key on "brave", so
+    the panel shows a duplicate row and the rule matcher silently falls through
+    to a weaker field. Stripped here, at the single funnel every identity
+    passes through, so it can never be stored or compared.
+
+    The marker is matched case-insensitively; the rest of the name keeps its
+    case.
+    """
+    s = s or ""
+    return s[:-len(" (deleted)")].rstrip() if s.lower().endswith(" (deleted)") else s
+
+
 def basename(p):
-    return (p or "").rsplit("/", 1)[-1]
+    return strip_deleted((p or "").rsplit("/", 1)[-1])
 
 
 # One-line diagnostics about the store, surfaced through `list`'s error field.
@@ -249,8 +268,10 @@ def strip_input(s):
     s = s or ""
     if s.lower().endswith(" input"):
         t = s[: -len(" input")].rstrip()
-        return t if t else s
-    return s
+        s = t if t else s
+    # After the " input" removal, not before: a browser input client reports as
+    # "Brave (deleted) input", so the artifact sits inside, not at the end.
+    return strip_deleted(s)
 
 
 def key_of_r(r):
@@ -784,6 +805,29 @@ def selftest():
 
     check("strip_input", strip_input("Signal input"), "Signal")
     check("basename", basename("/usr/lib/brave-bin/brave"), "brave")
+
+    # PipeWire's " (deleted)" artifact, as seen on a live Brave stream after the
+    # browser replaced its own executable: binary="brave (deleted)".
+    check("strip_deleted clean", strip_deleted("brave"), "brave")
+    check("strip_deleted artifact", strip_deleted("brave (deleted)"), "brave")
+    check("strip_deleted keeps case", strip_deleted("Brave (Deleted)"), "Brave")
+    check("strip_deleted in path", basename("/usr/lib/brave-bin/brave (deleted)"), "brave")
+    check("strip_deleted not in basename position", basename("brave (deleted)"), "brave")
+    check("strip_deleted on app name", strip_input("Brave (deleted) input"), "Brave")
+    check("strip_deleted leaves similar names", basename("brave-deleted"), "brave-deleted")
+    check("strip_deleted on empty", strip_deleted(""), "")
+    # Binary-only overlap, with both app names empty: this is what the panel's
+    # duplicate rows came from. It passes today only because the appName
+    # fallback would rescue a mismatch, so the names are cleared to isolate the
+    # binary field and make the test fail without strip_deleted.
+    check("identities_overlap deleted-binary vs clean", identities_overlap(
+        {"appName": "", "binary": "brave (deleted)", "nodeName": ""},
+        {"app": "", "binary": "brave", "node": ""}), True)
+    # And the direction that matters for an already-written store: a rule saved
+    # while the artifact was present must still match a clean stream.
+    check("identities_overlap clean stream vs deleted rule", identities_overlap(
+        {"appName": "", "binary": "brave", "nodeName": ""},
+        {"app": "", "binary": "brave (deleted)", "node": ""}), True)
 
     check("describe_issues clean", describe_issues("Sink #88", True), [])
     check("describe_issues no sinks", describe_issues("", True), ["pactl returned no sink data"])

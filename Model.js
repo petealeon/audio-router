@@ -9,7 +9,7 @@
 function basename(p) {
   p = String(p || "")
   var i = p.lastIndexOf("/")
-  return i >= 0 ? p.substring(i + 1) : p
+  return stripDeleted(i >= 0 ? p.substring(i + 1) : p)
 }
 
 // Component names that must display under their parent app. "ringrtc" is
@@ -19,14 +19,34 @@ function basename(p) {
 // shared with the Signal row either way.
 var COMPONENT_BASE = { ringrtc: "Signal" }
 
+// PipeWire's " (deleted)" artifact. When a process's on-disk executable is
+// replaced under it (a browser updating itself, a package upgrade), the binary
+// is reported as "brave (deleted)". That is not a binary name, and letting it
+// through splits one app into two identities: the live stream keys on
+// "brave (deleted)" while its client and its stored rule key on "brave", so the
+// panel rendered a second, stream-less row for the same app.
+//
+// Normalised here as well as in the helper on purpose. This file is the panel's
+// identity authority and consumes `list` JSON, which can still carry a binary
+// written into the store before the helper learned to strip it, and a rule read
+// back from disk is exactly that case. Mirrors strip_deleted() in
+// assets/omarchy-router; covered by scripts/model-test.js.
+function stripDeleted(s) {
+  var t = String(s == null ? "" : s)
+  // Case-insensitive marker, but the name keeps its own case.
+  return t.toLowerCase().endsWith(" (deleted)") ? t.slice(0, -" (deleted)".length).trim() : t
+}
+
 // "Brave input" -> "Brave"; the " input" suffix is a browser artifact that
 // appears on the client/stream name but must not leak into display or keys.
+// "Brave (deleted) input" -> "Brave" as well, hence the strip inside the branch:
+// the artifact sits inside the " input" suffix, not after it.
 function stripInput(name) {
-  var s = String(name || "").trim()
+  var s = stripDeleted(String(name || "").trim())
   var lower = s.toLowerCase()
   if (lower in COMPONENT_BASE) return COMPONENT_BASE[lower]
   if (lower.endsWith(" input")) {
-    var t = s.slice(0, -6).trim()
+    var t = stripDeleted(s.slice(0, -6).trim())
     if (t !== "") return t
   }
   return s

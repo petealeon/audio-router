@@ -27,6 +27,19 @@ jobs:
       - name: Installer syntax
         run: bash -n install.sh
 
+      - name: Shell scripts
+        # `bash -n` only proves the installer parses. ShellCheck is what
+        # catches an unset variable used under `set -u`, an unquoted expansion,
+        # or a maskable `rm -rf` -- none of which are visible to a syntax check,
+        # and all of which run as root during install. Both shell scripts in
+        # the repository are clean at `style`, which is stricter than the
+        # `warning` level used here, so nothing is suppressed to make it pass.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          shellcheck --version
+          shellcheck -S warning install.sh scripts/qml-lint.sh
+
       - name: Manifest integrity
         run: python3 scripts/check-manifest.py
 

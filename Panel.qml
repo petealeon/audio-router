@@ -154,6 +154,11 @@ Panel {
   // Best known name per sink, including sinks pactl no longer reports (see
   // Model.friendlySinkName for the last-resort formatting).
   property var sinkLabels: ({})
+  // {stale sink name: live sink name} for rule targets that are really the same
+  // device under a different bluetooth profile index. The helper follows the
+  // device by MAC, so the app stays routed; the panel uses this to avoid also
+  // drawing a disconnected ghost row for the profile the rule happens to name.
+  property var sinkAliases: ({})
   property var pendingWrites: []
   property string defaultSinkName: ""
   property string stateSignature: ""
@@ -308,6 +313,17 @@ Panel {
     var obj
     try { obj = JSON.parse(raw) } catch (e) { return }
     if (!obj) return
+    // Normalise before anything reads it. applyState used to assume
+    // obj.sinkInputs was always an array, which holds for the current helper
+    // but not for a short payload from an older or failing one — and a throw
+    // here is unrecoverable, because it escapes before stateLoaded is set and
+    // the panel never comes up again until the plugin is reloaded.
+    if (!Array.isArray(obj.sinks)) obj.sinks = []
+    if (!Array.isArray(obj.sinkInputs)) obj.sinkInputs = []
+    if (!Array.isArray(obj.clients)) obj.clients = []
+    if (!Array.isArray(obj.rules)) obj.rules = []
+    if (!obj.labels || typeof obj.labels !== "object") obj.labels = {}
+    if (!obj.sinkAliases || typeof obj.sinkAliases !== "object") obj.sinkAliases = {}
     root.stateError = obj.error || ""
     if (root.dragging) return
 
@@ -345,7 +361,8 @@ Panel {
       obj.rules,
       stableCl,
       obj.defaultSink || "",
-      obj.labels || {}
+      obj.labels || {},
+      obj.sinkAliases || {}
     ])
     if (sig === root.stateSignature) return
     root.stateSignature = sig
@@ -354,6 +371,7 @@ Panel {
     root.clients = obj.clients || []
     root.rules = obj.rules || []
     root.sinkLabels = obj.labels || {}
+    root.sinkAliases = obj.sinkAliases || {}
     root.prunePendingWrites()
     root.defaultSinkName = obj.defaultSink || ""
     root.stateLoaded = true
@@ -509,6 +527,10 @@ Panel {
       var r2 = effective2[i]
       if (!r2.sink || r2.sink === "__default__") continue
       if (sinkKeys[r2.sink]) continue
+      // Same device, different profile index: the helper is routing this app to
+      // the live sink above, so a ghost row for the rule's stale name would show
+      // one headset twice and claim the app was not routed.
+      if (root.sinkAliases[r2.sink]) continue
       // An output a rule still points at but pactl no longer reports: a
       // disconnected bluetooth device, or an unplugged one. Name it from what
       // we last saw, not from the identifier, and leave it marked unavailable so

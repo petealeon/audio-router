@@ -84,7 +84,11 @@ if "$qmllint" --help 2>&1 | grep -q -- '--max-warnings'; then
 fi
 
 out="$("$qmllint" "${flags[@]}" "${imports[@]}" BarWidget.qml Panel.qml Model.js 2>&1)"
-status=$?
+# The exit code is deliberately not captured: qmllint returns 0 for warnings and
+# non-zero for parse errors, but it also returns non-zero for the unresolved-type
+# warnings that are expected whenever the omarchy shell is absent. The decision
+# below comes from the diagnostics instead. (ShellCheck flags the unused
+# assignment this replaced; it was left in from before that comment existed.)
 
 warnings="$(printf '%s\n' "$out" | grep -cE '^Warning:' || true)"
 # A QML file that will not load shows up as a syntax diagnostic, on every

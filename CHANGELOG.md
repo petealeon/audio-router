@@ -3,6 +3,108 @@
 All notable changes to `petealeon.router` are documented here. SemVer; releases are
 tagged `vX.Y.Z`.
 
+## [1.4.0] - 2026-09-27
+
+A correctness and hardening release. Three bugs could affect audio a user did
+not intend to move, and one could empty the whole panel.
+
+### Fixed
+- **The audio stack could be steered.** The list of applications never to route
+  was compared case-sensitively against names that PipeWire does not spell that
+  way. A live session here reports `WirePlumber` and `quickshell`, and the list
+  held `wireplumber` and `Quickshell`, so neither matched: both were offered in
+  the panel as routable, and `restore` — the command that implements "routing
+  off" — would move their streams. The same session also reports some clients
+  twice, once tagged `WirePlumber [client]`, and the tagged spelling slipped
+  through as well. Exclusion is now case-insensitive, ignores a trailing
+  bracketed tag, and is checked against the process binary as well as the
+  reported application name, so a stack stream cannot be moved even if it
+  presents an unfamiliar name. A test now cross-checks the helper's list
+  against the one in `Panel.qml`, because the two had drifted — which is how
+  this survived — and edits to either alone now fail the suite.
+
+- **One invalid byte could empty the entire panel.** Subprocess output was
+  decoded as UTF-8 with no error policy, and a single undecodable byte raised
+  inside the decode. Because the helper turns any failure into an empty string,
+  the result was not one bad character in one device name: the whole `list`
+  payload came back empty and the panel showed nothing at all. Device and
+  application names come from arbitrary user-controlled metadata, so this was
+  reachable. The output is now decoded with replacement, which costs the one
+  name a `\ufffd` and keeps the rest of the document.
+
+- **A Bluetooth rule broke when the device reconnected as a different profile.**
+  PipeWire suffixes Bluetooth outputs with a profile index that is not stable
+  across reconnects, so a headset that comes back as profile 2 exposes the same
+  speaker as `bluez_output.<mac>.2` where the rule says `.1`. Matching on the
+  sink name read that as "the device disconnected", so the app silently fell
+  back to the default output and played through the laptop while the panel
+  still showed it pinned to the headset — and replugging did not help, because
+  the rule failed the same comparison every time. Rules now match on the
+  embedded MAC, so the pin follows the device in either direction. Wired
+  outputs are still matched exactly, and a rule never moves to a device it did
+  not name. The panel no longer draws a second "disconnected" row for a device
+  that is present under another index.
+
+- **The routing off-switch was only enforced in the panel.** A watcher started
+  by a stale panel, by hand, or by anything else kept moving streams after the
+  user had switched routing off. The watcher now reads the preference itself, so
+  the switch holds at the point where the move happens; it idles instead of
+  steering, and costs one small file read per poll.
+
+### Changed
+- **The watcher polls at two speeds.** It previously spawned roughly four
+  `pactl` processes a second — about 1.9% of a core — for the whole session,
+  whether or not any audio existed. It now polls every 0.5s while something is
+  playing, which is the only time a stream can start on the wrong output, and
+  backs off to 2.5s when the session is silent, lingering briefly at the fast
+  cadence after the last stream so a pause between tracks cannot cause the next
+  one to be missed.
+
+- **The watcher log is bounded.** It lives on tmpfs, so an unbounded log is
+  memory the session never recovers, and it was written to without limit while
+  an unroutable app repeated the same line every 10 seconds. It is now capped at
+  256 KB with one previous generation kept, and an app with no matching rule is
+  reported once instead of every 10 seconds — the fact does not change between
+  polls, and a later match is already covered by the `rules reasserted (n)`
+  line.
+
+### Hardened
+- The state file is written mode `0600`, matching the rules store. It holds the
+  on/off preference and, since 1.3.2, a cache of Bluetooth device names and MAC
+  addresses; it was world-readable.
+- `Panel.qml` normalises the helper's payload before reading it, so a short or
+  unexpected response can no longer throw where it would wedge the panel until
+  the plugin was reloaded.
+- A store lock that cannot be opened is now a refusal with a message rather
+  than an unhandled error, and it falls back to a lock beside the rules file
+  when `$XDG_RUNTIME_DIR` is absent — the case outside a user session, where the
+  write previously could not proceed at all. A fresh install creates its
+  directory before looking for the lock.
+- An unreadable rules file is preserved once per process rather than retried
+  twice a second, and when the rename cannot happen the panel says the file was
+  left in place instead of claiming a backup was made.
+
+### Docs and metadata
+- The README no longer claims the plugin is listed on the marketplace; it is
+  not. It also no longer claims only playing apps are listed — the panel lists
+  every client, and a pin can be made before an app has ever played. A *Data and
+  privacy* section now documents both files that are written, their contents,
+  their `0600` modes, the fact that `bluetoothctl` is optional, and how to
+  remove the cached device names.
+- `manifest.json` gained the `license`, `homepage`, `repository` and `keywords`
+  fields the marketplace listing uses.
+- `scripts/check-manifest.py` now requires those fields, checks the license
+  against known SPDX identifiers, requires a `LICENSE` file to back the declared
+  license, and cross-checks the manifest version against the version the widget
+  reports. Those two version strings were previously kept in step by hand.
+- ShellCheck runs in CI over both shell scripts. `bash -n` only proves a script
+  parses; it cannot see an unquoted expansion or a variable read under `set -u`,
+  in a script that runs as root during install. This surfaced one dead
+  assignment in `scripts/qml-lint.sh`.
+- `docs/marketplace-submission.md` is refreshed for this version, with the
+  tagging step left explicitly last: the marketplace scans the exact tagged
+  commit, so the listing metadata has to be correct on that tree.
+
 ## [1.3.2] - 2026-09-27
 
 ### Fixed

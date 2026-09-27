@@ -57,6 +57,10 @@ STORE = os.environ.get("ROUTER_STORE") or f"{os.path.expanduser('~')}/.config/om
 LOCK = f"{RUNTIME}/omarchy-router.store.lock"
 WATCH_MARK = f"{RUNTIME}/omarchy-router.watch.lock"
 LOG = f"{RUNTIME}/omarchy-router.watch.log"
+# Bound the watch log, which lives on tmpfs and is therefore charged to the
+# session's memory. One previous generation is kept so the failure that
+# triggered rotation is still readable.
+LOG_MAX_BYTES = 256 * 1024
 # Routing on/off is a user preference, not derived state: it has to outlive the
 # shell, because a reload otherwise silently switches routing back on. Lives
 # beside the rule store in the config dir the plugin already owns.
@@ -69,7 +73,27 @@ STATE = os.environ.get("ROUTER_STATE") or f"{os.path.expanduser('~')}/.config/om
 # arrives as 9, not 137), so 143 is deliberately absent.
 INTENTIONAL_EXITS = (0, 3, 15)
 
-EXCLUDE_APPS = {"EasyEffects", "Quickshell", "wireplumber", "pipewire", "systemd", "pactl", "pw-dump", "xdg-desktop-portal", "xdg-desktop-portal-hyprland"}
+# Watcher poll cadence. Fast while anything is playing, since that is when a
+# stream can start out on the wrong output and the user notices; slow when
+# silent, where the only thing that can change is a device appearing.
+POLL_ACTIVE = 0.5
+POLL_IDLE = 2.5
+# Keep polling fast briefly after the last stream ends, so a pause between
+# tracks does not drop back to the slow cadence and miss the next one starting.
+POLL_LINGER = 3.0
+
+# Applications that are part of the audio stack itself, or are our own tooling.
+# They are never steered: moving a wireplumber or portal stream would fight the
+# session manager, and moving our own pactl calls is meaningless.
+#
+# Stored lowercase and compared through is_excluded_app, never by raw
+# membership: pactl reports "WirePlumber" and "quickshell", so a set holding
+# "wireplumber" and "Quickshell" silently matched neither and let both through
+# as steerable. Kept in sync with Panel.qml's systemBinaries by a selftest that
+# reads that list out of the QML, so editing one side alone fails the suite.
+EXCLUDE_APPS = {"easyeffects", "quickshell", "wireplumber", "pipewire", "systemd",
+                "pactl", "pw-dump", "python3",
+                "xdg-desktop-portal", "xdg-desktop-portal-hyprland"}
 
 RE_APP = re.compile(r'^application\.name\s*=\s*"(.*)"')
 RE_BIN = re.compile(r'^application\.process\.binary\s*=\s*"(.*)"')
@@ -94,10 +118,27 @@ def say_exit(msg, reason):
     sys.stderr.flush()
 
 
+def decode_output(raw):
+    """Decode subprocess bytes, never losing the whole payload to one bad byte.
+
+    Pactl's output carries device and application names, which come from
+    arbitrary user-controlled metadata. A single invalid UTF-8 sequence used to
+    raise out of the decode and, because run() swallows every exception into "",
+    blank the entire panel -- one weird byte in one app name cost the user
+    every device. Replacing the bad bytes keeps the rest of the document, which
+    is what a name field can absorb: a device shows as "<name>\\ufffd" and stays
+    usable instead of the list vanishing.
+
+    Kept as a separate function so the selftest can pin the policy with no
+    subprocess and no pactl.
+    """
+    return (raw or b"").decode("utf-8", "replace")
+
+
 def run(cmd, timeout=4):
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return r.stdout
+        r = subprocess.run(cmd, capture_output=True, timeout=timeout)
+        return decode_output(r.stdout)
     except Exception:
         return ""
 
@@ -119,6 +160,12 @@ def strip_deleted(s):
     """
     s = s or ""
     return s[:-len(" (deleted)")].rstrip() if s.lower().endswith(" (deleted)") else s
+
+
+# A trailing bracketed tag on a PipeWire application name, e.g. the
+# "WirePlumber [client]" a live session reports alongside the plain
+# "WirePlumber" for the same binary. See norm_client_name.
+CLIENT_TAG_RE = re.compile(r"\s*\[[^\]]{0,64}\]\s*$")
 
 
 def basename(p):
@@ -231,13 +278,23 @@ def resolve_sink_labels(sinks, rules):
 # One-line diagnostics about the store, surfaced through `list`'s error field.
 # Mutable container so plain functions can set it without a `global` dance.
 STORE_ISSUE = [""]
+# Set once a corrupt rules file has been dealt with, so a store that stays
+# unreadable is reported once instead of on every poll (see preserve_corrupt_store).
+_CORRUPT_REPORTED = [False]
 
 
 def load_rules():
     """Read the rules store. A missing file returns []. A corrupt or
     wrong-shaped file is never silently overwritten: a corrupt file is first
     renamed to ``router-rules.json.corrupt.<ts>`` and the problem is recorded
-    in STORE_ISSUE for the panel to show."""
+    in STORE_ISSUE for the panel to show.
+
+    The rename is attempted at most once per process. The watcher reads the
+    store on every poll, so a store that stays corrupt — an unwritable config
+    dir, say, where the rename keeps failing — otherwise retried the
+    preservation attempt twice a second forever, and the user saw a
+    "preserved as ..." message that was never true.
+    """
     try:
         with open(STORE, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -248,14 +305,36 @@ def load_rules():
     except FileNotFoundError:
         return []
     except Exception:
-        ts = time.strftime("%Y%m%d%H%M%S")
-        backup = f"{STORE}.corrupt.{ts}"
-        try:
-            os.replace(STORE, backup)
-        except Exception:
-            backup = STORE
-        STORE_ISSUE[0] = f"router-rules.json was unreadable; preserved as {os.path.basename(backup)}"
+        backup = preserve_corrupt_store()
+        if backup:
+            STORE_ISSUE[0] = f"router-rules.json was unreadable; preserved as {os.path.basename(backup)}"
+        else:
+            STORE_ISSUE[0] = (
+                "router-rules.json was unreadable and could NOT be preserved — the file "
+                "was left in place. Fix or remove it by hand; nothing will be overwritten "
+                "until then."
+            )
         return []
+
+
+def preserve_corrupt_store():
+    """Move an unreadable rules file aside, once. Returns the new path, or None.
+
+    Returning None is a real outcome, not an error: if the rename cannot
+    happen the corrupt file is still on disk untouched, which is the safe
+    state. Saying it was "preserved" when it was not would send the user
+    looking for a backup that does not exist.
+    """
+    if _CORRUPT_REPORTED[0]:
+        return None
+    _CORRUPT_REPORTED[0] = True
+    backup = f"{STORE}.corrupt.{time.strftime('%Y%m%d%H%M%S')}"
+    try:
+        os.replace(STORE, backup)
+        return backup
+    except OSError as ex:
+        say(f"could not preserve unreadable {STORE}: {ex}")
+        return None
 
 
 def write_rules(rules):
@@ -336,7 +415,7 @@ def parse_clients(raw):
 
     def finish():
         app = cur.get("appName", "")
-        if app and app not in EXCLUDE_APPS:
+        if app and not is_excluded_client(cur):
             key = (cur.get("binary") or app).lower()
             if key not in seen:
                 seen.add(key)
@@ -360,11 +439,48 @@ def parse_clients(raw):
 
 
 def is_valid_input(e):
-    return e["appName"] not in EXCLUDE_APPS
+    return not is_excluded_client(e)
 
 
 def norm(s):
     return (s or "").strip().lower()
+
+
+def norm_client_name(s):
+    """Normalise an application name for exclusion checks.
+
+    PipeWire tags some client names with a bracketed suffix. A live session here
+    reports both "WirePlumber" and "WirePlumber [client]" for the same binary,
+    so an exclusion list that matched the raw string caught one spelling and
+    let the other through — the audio stack stayed steerable. Drop any trailing
+    bracket tag before comparing.
+    """
+    return norm(CLIENT_TAG_RE.sub("", s or ""))
+
+
+def is_excluded_app(name):
+    """True for the audio stack and our own tooling, case-insensitively.
+
+    Single predicate for both call sites: parse_clients (which rows the panel
+    may offer) and is_valid_input (what the watcher will steer and what restore
+    will move). They must agree — a row the panel offers but the matcher
+    refuses to move is a dead end for the user, and the reverse is a stream
+    being dragged somewhere nobody asked for.
+    """
+    return norm_client_name(name) in EXCLUDE_APPS
+
+
+def is_excluded_client(e):
+    """True when a stream belongs to the audio stack, by name or by binary.
+
+    Both fields are consulted because either can identify the stack: WirePlumber
+    arrives as the appName "WirePlumber [client]", and a stream that reports an
+    unfamiliar appName but a binary of "wireplumber" is just as much the session
+    manager. Panel.qml already filtered rows on the binary, so checking only the
+    appName here meant the panel and the steering logic could disagree.
+    """
+    return (is_excluded_app(e.get("appName", ""))
+            or is_excluded_app(basename(e.get("binary", ""))))
 
 
 def strip_input(s):
@@ -429,10 +545,39 @@ def acquire_ex(fd, timeout=5.0):
             time.sleep(0.02)
 
 
+def open_lock():
+    """Open the store lock file, or return None when no lock is usable.
+
+    The primary location is $XDG_RUNTIME_DIR, which is right in a normal
+    systemd-backed session: the lock then disappears on logout instead of
+    outliving it. But that directory does not exist outside a user session
+    (a bare container, some CI contexts), and opening it there raised out of
+    the caller as an unhandled OSError — a traceback instead of a decision.
+
+    Falling back to a lock beside the store keeps writes working there. The
+    fallback is safe because the failure is a property of the directory, not of
+    one process: if the runtime path is unwritable it is unwritable for every
+    writer, so they all choose the same lock and still exclude each other.
+    """
+    fallback = os.path.join(os.path.dirname(STORE) or ".", "omarchy-router.store.lock")
+    for path in (LOCK, fallback):
+        try:
+            return open(path, "a", encoding="utf-8")
+        except OSError:
+            continue
+    return None
+
+
 def read_store_locked():
     rules = []
+    fd = open_lock()
+    if fd is None:
+        # A read is safe to do unlocked: load_rules is a plain read plus an
+        # atomic rename in the corrupt case, neither of which can lose a
+        # concurrent writer's data the way an unlocked write can.
+        return load_rules()
     try:
-        with open(LOCK, "w", encoding="utf-8") as fd:
+        with fd:
             fcntl.flock(fd, fcntl.LOCK_SH)
             rules = load_rules()
     except Exception:
@@ -441,15 +586,31 @@ def read_store_locked():
 
 
 def modify_store(mutator):
-    os.makedirs(os.path.dirname(STORE), exist_ok=True)
-    with open(LOCK, "w", encoding="utf-8") as fd:
+    # Create the config directory before looking for a lock: the fallback lock
+    # lives beside the store, so on a fresh install the directory it needs does
+    # not exist yet and the write would be refused for a store we are about to
+    # create anyway. A directory that cannot be created is a refusal, not a
+    # traceback -- callers treat the result as a decision.
+    try:
+        os.makedirs(os.path.dirname(STORE) or ".", exist_ok=True)
+    except OSError as ex:
+        say(f"store: could not create {os.path.dirname(STORE)}: {ex}")
+        wlog(f"refused store write: cannot create store dir: {ex}")
+        return False
+    fd = open_lock()
+    if fd is None:
+        say("store lock unavailable — refusing write")
+        wlog("refused store write: no usable lock path")
+        return False
+    with fd:
         if not acquire_ex(fd):
             # Never perform an unlocked read-modify-write: two concurrent
             # writers could each drop the other's rule. Skip and surface it.
             say("store lock unavailable — refusing write")
             wlog("refused store write: lock unavailable after 5s")
-            return
+            return False
         write_rules(mutator(load_rules()))
+    return True
 
 
 def move(id_, sink_name):
@@ -458,29 +619,109 @@ def move(id_, sink_name):
     run(["pactl", "move-sink-input", id_, sink_name], timeout=2)
 
 
+def poll_delay(has_streams, now, active_until):
+    """Seconds to wait before the next watcher poll.
+
+    Fast while anything is playing, slow when silent. The fast cadence only
+    matters when a stream can start out on the wrong output, which is exactly
+    when something is playing; when the session is silent the only thing that
+    can change is a device appearing, and 2.5s is imperceptible for that. The
+    old fixed 0.5s cost ~4 pactl spawns a second, ~1.9% of a core, for the whole
+    session regardless of whether any audio existed.
+
+    active_until is a monotonic deadline, not a flag: after the last stream
+    ends the cadence stays fast for POLL_LINGER seconds, so a pause between
+    tracks does not drop to the slow cadence and then miss the next track
+    starting during it.
+    """
+    return POLL_ACTIVE if (has_streams or now < active_until) else POLL_IDLE
+
+
 def wlog(msg):
+    """Append a line to the watcher log, keeping the file strictly bounded.
+
+    The log lives on tmpfs, so an unbounded one is memory the session never gets
+    back: a watcher left running over a long session previously wrote unbounded
+    lines at ~2/second. One previous generation is kept, so the failure that
+    triggered rotation is still readable.
+
+    The incoming line is measured before the rotation decision, not after.
+    Testing the size first and writing second let a file sit past the cap until
+    the *next* call came along, so the bound was "cap plus whatever accumulated
+    in between" rather than the cap. With a single line also truncated, every
+    generation now provably ends at or below LOG_MAX_BYTES: a line is only
+    appended when it fits, and a line that can never fit is shortened.
+    """
     try:
+        line = f"[{time.strftime('%T')}] {msg}\n"
+        if len(line) > LOG_MAX_BYTES // 2:
+            line = line[:LOG_MAX_BYTES // 2] + " ...[truncated]\n"
+        if os.path.exists(LOG) and os.path.getsize(LOG) + len(line) > LOG_MAX_BYTES:
+            os.replace(LOG, LOG + ".1")
         with open(LOG, "a", encoding="utf-8") as f:
-            f.write(f"[{time.strftime('%T')}] {msg}\n")
+            f.write(line)
     except OSError:
         pass
+
+
+def bluetooth_profile_index(name):
+    """Trailing profile number of a bluez_output sink, or 0 when absent."""
+    m = re.search(r"\.(\d+)$", (name or "").strip())
+    return int(m.group(1)) if m else 0
+
+
+def same_device_sink(target, sinks):
+    """Live sink name for the same physical device under another profile.
+
+    PipeWire's Bluetooth profile index is not stable across reconnects. A card
+    that comes back as profile 2 instead of profile 1 exposes the very same
+    speaker under a different sink name, so a rule stored as ".1" no longer
+    matches by name -- which reads as "the device vanished". The rule then fell
+    through to the default sink: audio played out of the laptop while the panel
+    still showed the app pinned to the headset, and re-plugging the headset
+    would not fix it because the rule kept failing the same name comparison.
+
+    Matching on the MAC instead follows the device rather than the profile
+    index, so the rule survives a re-index. Deliberately narrow: Bluetooth
+    sinks only, since mac_from_sink returns None for everything else, and only
+    same-device candidates, because a wrong match would move a stream to a
+    speaker the rule never named.
+
+    A device can expose more than one profile at once (A2DP alongside HFP), so
+    when several same-MAC sinks are live the lowest profile index wins, matching
+    PipeWire's own preference for the high-quality profile and keeping the
+    choice stable across polls. Ties fall back to name order.
+    """
+    mac = mac_from_sink(target)
+    if not mac:
+        return ""
+    matches = [s["name"] for s in sinks if mac_from_sink(s.get("name")) == mac]
+    if not matches:
+        return ""
+    return sorted(matches, key=lambda n: (bluetooth_profile_index(n), n))[0]
 
 
 def effective_sink(target, sinks, default=None):
     """Sink name to actually steer a stream to for a persisted rule.
 
     If the rule's target device is currently present, return it unchanged.
-    If it has disconnected, return the live default sink instead — the stream
-    is never left muted on a vanished device, and the rule itself is preserved
-    so the next poll with the device present re-asserts it. Returns "" when
-    neither the target nor the default is usable. `default` is injectable for
-    tests; when None it is read from pactl.
+    If the same device reappeared under a different Bluetooth profile index,
+    return that: it is the speaker the rule was written for, and following the
+    index would silently divert audio to the default sink.
+    If the device is genuinely gone, return the live default sink instead — the
+    stream is never left muted on a vanished device, and the rule itself is
+    preserved so the next poll with the device present re-asserts it. Returns ""
+    when neither the target nor the default is usable. `default` is injectable
+    for tests; when None it is read from pactl.
     """
     if not target:
         return ""
     names = {s["name"] for s in sinks}
     if target in names:
         return target
+    alias = same_device_sink(target, sinks)
+    if alias:
+        return alias
     if default is None:
         default = run(["pactl", "get-default-sink"]).strip() or ""
     if default in names:
@@ -515,6 +756,31 @@ def describe_issues(sinks_raw, pactl_found):
     return issues
 
 
+def sink_alias_map(rules, sinks):
+    """{stale rule target: live sink name} for the same device re-indexed.
+
+    A rule naming ".1" for a card that came back as ".2" is still satisfied —
+    effective_sink follows the MAC — so the panel must not also draw the
+    connected row for ".2" and a disconnected ghost row for the rule's ".1".
+    That pairing would show one headset twice and imply the app was not routed.
+
+    Only rules whose target is absent from `sinks` and that resolve to a live
+    same-device sink appear here; a wired target never matches, and a device
+    that is genuinely gone must keep its ghost row, since that row is how the
+    user learns their headset is unplugged.
+    """
+    names = {s["name"] for s in sinks}
+    aliases = {}
+    for r in rules:
+        target = r.get("sink")
+        if not target or target in names or target == "__default__":
+            continue
+        alias = same_device_sink(target, sinks)
+        if alias:
+            aliases[target] = alias
+    return aliases
+
+
 def cmd_list():
     sinks_raw = run(["pactl", "list", "sinks"])
     inputs_raw = run(["pactl", "list", "sink-inputs"])
@@ -538,6 +804,9 @@ def cmd_list():
             return {**obj, "sinkLabels": cache, "tried": sorted(done | set(pending))}
 
         modify_state(cache_labels)
+    # Tell the panel which rule targets are really the same device under a
+    # different Bluetooth profile index, so it can suppress the duplicate ghost
+    # row (see sink_alias_map).
     payload = {
         "sinks": sinks,
         "defaultSink": default_sink,
@@ -545,6 +814,7 @@ def cmd_list():
         "clients": clients,
         "rules": rules,
         "labels": labels,
+        "sinkAliases": sink_alias_map(rules, sinks),
     }
     issues = merge_issues(
         describe_issues(sinks_raw, shutil.which("pactl") is not None),
@@ -671,8 +941,18 @@ def modify_state(mutator):
     instead would let the poll drop a preference the user had just toggled, and
     vice versa. Refuses without the lock for the same reason modify_store does.
     """
-    os.makedirs(os.path.dirname(STATE), exist_ok=True)
-    with open(LOCK, "w", encoding="utf-8") as fd:
+    try:
+        os.makedirs(os.path.dirname(STATE) or ".", exist_ok=True)
+    except OSError as ex:
+        say(f"state: could not create {os.path.dirname(STATE)}: {ex}")
+        wlog(f"refused state write: cannot create state dir: {ex}")
+        return False
+    fd = open_lock()
+    if fd is None:
+        say("state lock unavailable — refusing write")
+        wlog("refused state write: no usable lock path")
+        return False
+    with fd:
         if not acquire_ex(fd):
             say("state lock unavailable — refusing write")
             wlog("refused state write: lock unavailable after 5s")
@@ -686,6 +966,11 @@ def modify_state(mutator):
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(after, f, indent=2)
                 f.write("\n")
+            # The state file holds the on/off preference and, since v1.3.2, a
+            # cache of Bluetooth device names and MACs. That is device
+            # identifying information, so it gets the same 0600 the rules store
+            # already had; without this it was world-readable on a shared box.
+            os.chmod(tmp, 0o600)
             os.replace(tmp, STATE)
         except OSError as ex:
             say(f"state: could not write {STATE}: {ex}")
@@ -798,24 +1083,65 @@ def cmd_watch():
     traced = {}
     missing_reported = {}
     error_last = {}
+    # The off switch was enforced only in QML, which left the actual side effect
+    # unguarded: a watcher started by a stale panel, by hand, or by anything
+    # else kept moving streams after the user had switched routing off. The
+    # preference is read here, where the move happens, so it holds no matter who
+    # started the process. Default stays "on" — see load_routing_state.
+    off_logged = False
+    # Monotonic deadline until which the fast cadence is kept in force, pushed
+    # forward every time a stream is seen. Starts at 0 so a session that never
+    # plays anything polls slowly from the first pass. See poll_delay.
+    active_until = 0.0
     while True:
+        delay = POLL_ACTIVE
         try:
             if os.getppid() != parent:
                 say_exit("watch: parent is gone — exiting", "parent")
                 sys.exit(3)
+            if not load_routing_state():
+                # Idle rather than exit: a panel that reopens would otherwise
+                # restart us in a loop, and the parent may be about to stop us
+                # deliberately. Nothing is spawned, so the cost is one small
+                # read of the preference file per poll.
+                if not off_logged:
+                    off_logged = True
+                    say("watch: routing is off — watcher idle")
+                    wlog("routing is off; watcher idle (not steering)")
+                time.sleep(POLL_IDLE)
+                continue
+            off_logged = False
+            now = time.monotonic()
             rules = read_store_locked()
+            # Bound before use: the cadence below is computed whether or not any
+            # rules exist, and with no rules nothing below ever assigns inputs.
+            inputs = []
             if rules:
                 sinks = parse_sinks(run(["pactl", "list", "sinks"]))
                 sink_by_index = {s["index"]: s for s in sinks}
                 inputs = [e for e in parse_inputs(run(["pactl", "list", "sink-inputs"]), sink_by_index) if is_valid_input(e)]
+                # Only real streams count as activity. A session with rules but
+                # nothing playing is the common case, and that is the case that
+                # gets to poll slowly. The deadline starts at 0, so a watcher
+                # that never sees a stream never lingers without needing a
+                # separate flag to clear it.
+                if inputs:
+                    active_until = now + POLL_LINGER
                 moved = 0
                 for e in inputs:
                     r = match_rule(e, rules)
                     if not r or not r.get("sink"):
                         if r is None:
+                            # Once per stream, not once every 10s. Whether an app
+                            # matches a rule does not change between polls, so
+                            # the repeat only ever added log volume: a session
+                            # with a few unroutable apps filled hundreds of
+                            # kilobytes saying the same thing. If a rule for that
+                            # app appears later, the stream starts moving and
+                            # "rules reasserted (n)" says so.
                             tk = norm(basename(e.get("binary", ""))) or norm(basename(e.get("nodeName", ""))) or norm(e.get("appName", ""))
-                            if (len(traced) < 512 or tk in traced) and time.monotonic() - traced.get(tk, 0) > 10:
-                                traced[tk] = time.monotonic()
+                            if len(traced) < 512 and tk not in traced:
+                                traced[tk] = True
                                 wlog(f"no rule match: app={e.get('appName','')!r} bin={e.get('binary','')!r} node={e.get('nodeName','')!r}")
                         continue
                     if r["sink"] == "__default__":
@@ -835,12 +1161,13 @@ def cmd_watch():
                     moved += 1
                 if moved:
                     wlog(f"rules reasserted ({moved} stream{'s' if moved != 1 else ''})")
+            delay = poll_delay(bool(inputs), time.monotonic(), active_until)
         except Exception as ex:
             say(f"watch: poll error: {ex}")
             if due(error_last.get("poll"), time.monotonic(), 10):
                 error_last["poll"] = time.monotonic()
                 wlog(f"poll error: {ex}")
-        time.sleep(0.5)
+        time.sleep(delay)
 
 
 CANONICAL_SINKS = """Sink #88
@@ -924,6 +1251,383 @@ def selftest():
     check("effective_sink missing->default", effective_sink("bluez_output.gone.1", sinks, dflt), dflt)
     check("effective_sink both absent", effective_sink("bluez_output.gone.1",
                                                        [s for s in sinks if s["name"] != dflt], "gone-default"), "")
+
+    # --- bluetooth re-indexing must follow the device, not the profile ----
+    # The bug this pins: the rule names ".1", the card came back as ".2", name
+    # matching missed, and the app silently fell to the default sink while the
+    # panel still showed it pinned to the headset. Replugging changed nothing,
+    # because the rule failed the same name comparison every time.
+    reindexed = [s for s in sinks if s["name"] != target]
+    reindexed.append({"index": 41, "name": "bluez_output.24_06_11_A5_E7_95.2",
+                      "desc": "MOONDROP BLOCK", "available": True})
+    check("same_device_sink follows MAC across profiles",
+          same_device_sink("bluez_output.24_06_11_A5_E7_95.1", reindexed), "bluez_output.24_06_11_A5_E7_95.2")
+    check("effective_sink re-indexed device stays on bluetooth",
+          effective_sink("bluez_output.24_06_11_A5_E7_95.1", reindexed, dflt), "bluez_output.24_06_11_A5_E7_95.2")
+    # And the reverse direction: rule says ".2", card came back as ".1".
+    check("effective_sink re-indexed forward",
+          effective_sink("bluez_output.24_06_11_A5_E7_95.2", sinks, dflt), target)
+    # Suffix optional, per the v1.3.2 tolerance.
+    check("same_device_sink tolerates missing profile index",
+          same_device_sink("bluez_output.24_06_11_A5_E7_95", reindexed), "bluez_output.24_06_11_A5_E7_95.2")
+    # A different device must not match, and neither must a wired sink: sending
+    # audio to a speaker the rule never named is worse than falling back.
+    check("same_device_sink rejects a different MAC",
+          same_device_sink("bluez_output.23_10_18_B3_17_FD.1", reindexed), "")
+    check("same_device_sink rejects a wired target",
+          same_device_sink("alsa_output.usb-Generic_ThinkPad_Dock_USB_Audio-00.analog-stereo", reindexed), "")
+    check("same_device_sink rejects empty target", same_device_sink("", reindexed), "")
+    check("same_device_sink rejects None target", same_device_sink(None, reindexed), "")
+    check("same_device_sink with no sinks", same_device_sink(target, []), "")
+    check("effective_sink still falls back for a genuinely absent device",
+          effective_sink("bluez_output.23_10_18_B3_17_FD.1", reindexed, dflt), dflt)
+    # A hand-edited rules file may spell the MAC in lower case; it is still the
+    # same device. (PipeWire always emits the lower-case "bluez_output"
+    # prefix, so only the hex digits vary in practice.)
+    check("same_device_sink normalises MAC hex case",
+          same_device_sink("bluez_output.24_06_11_a5_e7_95.9", reindexed), "bluez_output.24_06_11_A5_E7_95.2")
+    # Two profiles of one card live at once: lowest index wins, deterministically,
+    # so the watcher does not flip between them on alternating polls.
+    both = reindexed + [{"index": 42, "name": "bluez_output.24_06_11_A5_E7_95.3",
+                        "desc": "MOONDROP BLOCK", "available": True}]
+    for _ in range(4):
+        check("same_device_sink prefers lowest profile when several are live",
+              same_device_sink("bluez_output.24_06_11_A5_E7_95.1", both), "bluez_output.24_06_11_A5_E7_95.2")
+    check("bluetooth_profile_index parses", bluetooth_profile_index("bluez_output.24_06_11_A5_E7_95.2"), 2)
+    # Profile 10 must order after profile 2, not before: comparing the suffixes
+    # as strings puts ".10" first and would hand the stream to the wrong
+    # profile of the same card.
+    check("bluetooth_profile_index is numeric not lexical",
+          bluetooth_profile_index("bluez_output.24_06_11_A5_E7_95.10"), 10)
+    tenth = [{"index": 41, "name": "bluez_output.24_06_11_A5_E7_95.10", "desc": "MOONDROP BLOCK", "available": True},
+             {"index": 42, "name": "bluez_output.24_06_11_A5_E7_95.2", "desc": "MOONDROP BLOCK", "available": True}]
+    check("profile 2 is chosen over profile 10",
+          same_device_sink("bluez_output.24_06_11_A5_E7_95.1", tenth), "bluez_output.24_06_11_A5_E7_95.2")
+
+    # The panel needs to know about the re-index too, or it draws the live ".2"
+    # row *and* a ghost row for the rule's ".1": one headset twice, and a claim
+    # that the app was never routed.
+    r1 = {"app": "mpv", "binary": "mpv", "node": "", "sink": "bluez_output.24_06_11_A5_E7_95.1"}
+    r2_ = {"app": "brave", "binary": "brave", "node": "", "sink": dflt}
+    r3 = {"app": "signal-desktop", "binary": "signal-desktop", "node": "",
+          "sink": "bluez_output.23_10_18_B3_17_FD.1"}
+    r4 = {"app": "firefox", "binary": "firefox", "node": "", "sink": "__default__"}
+    check("sink_alias_map maps the re-indexed rule",
+          sink_alias_map([r1, r2_, r3, r4], reindexed),
+          {"bluez_output.24_06_11_A5_E7_95.1": "bluez_output.24_06_11_A5_E7_95.2"})
+    # A device that is genuinely gone keeps its ghost row: that row is how the
+    # user finds out their headset is unplugged.
+    check("sink_alias_map omits an absent device",
+          sink_alias_map([r3], reindexed), {})
+    check("sink_alias_map omits a satisfied wired rule", sink_alias_map([r2_], reindexed), {})
+    check("sink_alias_map omits __default__", sink_alias_map([r4], reindexed), {})
+    check("sink_alias_map omits a rule already live",
+          sink_alias_map([{"app": "mpv", "binary": "mpv", "node": "", "sink": dflt}], reindexed), {})
+    check("sink_alias_map with no rules", sink_alias_map([], reindexed), {})
+    check("sink_alias_map with no sinks", sink_alias_map([r1], []), {})
+    check("sink_alias_map tolerates a rule with no sink key",
+          sink_alias_map([{"app": "mpv", "binary": "mpv", "node": ""}], reindexed), {})
+    check("sink_alias_map tolerates a null sink", sink_alias_map([{"app": "mpv", "sink": None}], reindexed), {})
+
+    # --- the off switch must be enforced where the move happens ------------
+    # cmd_watch is an infinite loop that talks to real pactl, so it cannot be
+    # invoked here. What matters is structural: the preference has to be read
+    # before anything is spawned and before any stream is moved, or the switch
+    # is decorative. Asserting the order in the source is the honest way to pin
+    # that without a live audio session.
+    with open(os.path.abspath(__file__), encoding="utf-8") as f:
+        _src = f.read()
+    _watch = _src[_src.index("def cmd_watch"):]
+    _watch = _watch[:_watch.index("\ndef ", 1)]
+
+    def _at(needle):
+        """Offset of `needle` in the watcher source, or -1 when absent.
+
+        -1 rather than a raised ValueError on purpose: a refactor that removes
+        one of these constructs should produce a named failure, not a traceback
+        that takes the rest of the suite down with it and hides which of the
+        other checks still hold.
+        """
+        return _watch.find(needle)
+
+    def _before(first, second):
+        """True when `first` appears, and appears before `second`."""
+        a, b = _at(first), _at(second)
+        return a != -1 and b != -1 and a < b
+
+    check("watch: reads the routing preference", _watch.count("load_routing_state()") >= 1, True)
+    # The gate must be a live conditional on that preference, not merely a call
+    # somewhere above: "if False and not load_routing_state():" would satisfy
+    # every ordering check below while steering every stream regardless.
+    check("watch: off gate is a live conditional on the preference",
+          _watch.count("if not load_routing_state():") >= 1, True)
+    check("watch: no disabled gate",
+          [ln.strip() for ln in _watch.splitlines()
+           if "load_routing_state()" in ln and "if not" in ln
+           and not ln.strip().startswith("if not load_routing_state():")], [])
+    check("watch: consults the preference before reading rules",
+          _before("load_routing_state()", "read_store_locked()"), True)
+    check("watch: consults the preference before spawning pactl",
+          _before("load_routing_state()", 'run(["pactl", "list", "sinks"])'), True)
+    check("watch: consults the preference before moving a stream",
+          _before("load_routing_state()", 'move(e["id"], eff)'), True)
+    # Idling must not cost a pactl call: the gate returns to sleep immediately.
+    check("watch: idles on the off branch",
+          _before("time.sleep(POLL_IDLE)", 'run(["pactl", "list", "sinks"])'), True)
+    # Announced once, not once per poll, or a long idle session floods the log.
+    check("watch: logs the idle state once", _watch.count("off_logged = True"), 1)
+    check("watch: resets the latch when re-enabled", _watch.count("off_logged = False") >= 1, True)
+
+    # Unroutable streams are reported once each, not re-reported on a timer.
+    # Re-logging every 10s said the same thing ~13 MB/day on tmpfs without ever
+    # adding information: whether an app matches a rule does not change between
+    # polls, and a later match is already covered by "rules reasserted (n)".
+    check("watch: reports an unmatched stream once", _watch.count("tk not in traced") >= 1, True)
+    check("watch: marks the stream as reported, not timestamped",
+          _watch.count("traced[tk] = True") >= 1, True)
+    check("watch: no timed re-report of unmatched streams",
+          "traced.get(tk, 0)" in _watch, False)
+    check("watch: unmatched streams stay bounded", _watch.count("len(traced) < 512") >= 1, True)
+
+    # --- adaptive cadence -------------------------------------------------
+    # Pure, so the policy is testable without a session. Two properties matter:
+    # audio playing means the fast cadence, and silence means the slow one.
+    check("poll_delay: fast while something plays", poll_delay(True, 1000.0, 0.0), POLL_ACTIVE)
+    check("poll_delay: slow when silent", poll_delay(False, 1000.0, 0.0), POLL_IDLE)
+    check("poll_delay: fast is faster than slow", POLL_ACTIVE < POLL_IDLE, True)
+    # Linger: the deadline keeps the fast cadence for a moment after the last
+    # stream, so a pause between tracks cannot drop us to slow and then miss
+    # the next track arriving inside the gap.
+    check("poll_delay: lingers fast just after the last stream",
+          poll_delay(False, 1000.0, 1000.0 + POLL_LINGER - 0.1), POLL_ACTIVE)
+    check("poll_delay: stops lingering once the deadline passes",
+          poll_delay(False, 1000.0 + POLL_LINGER + 0.1, 1000.0 + POLL_LINGER), POLL_IDLE)
+    # Simulate real loop progression: a stream is seen, then time passes at the
+    # fast cadence. The linger window is POLL_LINGER long, so the fast cadence
+    # must hold for exactly that many polls and then give way.
+    _seen_at = 1000.0
+    _deadline = _seen_at + POLL_LINGER
+    _polls = int(POLL_LINGER / POLL_ACTIVE) + 4
+    _delays = [poll_delay(False, _seen_at + _i * POLL_ACTIVE, _deadline) for _i in range(_polls)]
+    _fast_count = sum(1 for d in _delays if d == POLL_ACTIVE)
+    check("poll_delay: fast for exactly the linger window", _fast_count, int(POLL_LINGER / POLL_ACTIVE))
+    check("poll_delay: slow for every poll after it", _delays[_fast_count:], [POLL_IDLE] * (_polls - _fast_count))
+    check("poll_delay: slow once the linger window is over",
+          poll_delay(False, _seen_at + POLL_LINGER + 0.1, _deadline), POLL_IDLE)
+    check("poll_delay: deadline exactly at now is not lingering",
+          poll_delay(False, 1000.0, 1000.0), POLL_IDLE)
+    check("poll_delay: a stream always wins over a stale deadline",
+          poll_delay(True, 1000.0, 1.0), POLL_ACTIVE)
+    check("poll_delay: linger is longer than the slow cadence",
+          POLL_LINGER > POLL_IDLE, True)
+    check("poll_delay: cadence values are sane", 0 < POLL_ACTIVE <= 1.0 < POLL_IDLE <= 10.0, True)
+    # A caller that passes a zero deadline and no streams must not hang or
+    # return something nonsensical.
+    check("poll_delay: zero deadline, no streams", poll_delay(False, 0.0, 0.0), POLL_IDLE)
+    # The loop must not read `inputs` before the branch that binds it. With no
+    # rules the pactl block is skipped entirely, and the cadence line still
+    # runs, so an unbound name here would raise every single poll.
+    check("watch: binds inputs before the cadence line uses it",
+          _before("inputs = []", "delay = poll_delay("), True)
+    check("watch: cadence line reads the rebound inputs",
+          "delay = poll_delay(bool(inputs)" in _watch, True)
+    check("watch: no fixed 0.5s sleep left in the loop",
+          "time.sleep(0.5)" in _watch, False)
+    check("watch: the loop sleeps on the computed delay", "time.sleep(delay)" in _watch, True)
+    check("watch: lingers after the last stream",
+          _watch.count("active_until = now + POLL_LINGER") >= 1, True)
+    # Initialised before the loop, so a watcher that never sees a stream never
+    # lingers and polls slowly from the first pass.
+    check("watch: linger deadline starts at zero",
+          _before("active_until = 0.0", "while True:"), True)
+
+    # --- the watcher log must stay bounded ---------------------------------
+    # It lives on tmpfs, so an unbounded log is memory the session never
+    # recovers. wlog is pure enough to test against a temp path.
+    _real_log, _real_cap = LOG, LOG_MAX_BYTES
+    _td = tempfile.mkdtemp()
+    try:
+        # Rebind through globals(): a plain assignment here would make LOG a
+        # local of selftest() and break the read just above.
+        globals()["LOG"] = os.path.join(_td, "watch.log")
+        globals()["LOG_MAX_BYTES"] = 512
+
+        wlog("first line")
+        check("wlog: wrote a line", os.path.getsize(LOG) > 0, True)
+        check("wlog: timestamped prefix", open(LOG, encoding="utf-8").readline().startswith("["), True)
+        check("wlog: first generation has no rotation", os.path.exists(LOG + ".1"), False)
+
+        wlog("second line")
+        check("wlog: appends", len(open(LOG, encoding="utf-8").readlines()), 2)
+
+        # Cross the cap: the current file rotates, one generation is kept.
+        for i in range(40):
+            wlog(f"filler {i}")
+        check("wlog: keeps the log within the cap", os.path.getsize(LOG) < LOG_MAX_BYTES, True)
+        check("wlog: keeps exactly one previous generation", os.path.exists(LOG + ".1"), True)
+        check("wlog: previous generation is bounded", os.path.getsize(LOG + ".1") < LOG_MAX_BYTES, True)
+        check("wlog: rotation preserved earlier content",
+              "first line" in open(LOG + ".1", encoding="utf-8").read(), True)
+        check("wlog: newest lines survive rotation", "filler 39" in open(LOG, encoding="utf-8").read(), True)
+
+        # Soak: the invariant has to hold for every generation, not just the
+        # first rotation. This is the shape of a real session — thousands of
+        # appends over hours, with tmpfs memory as the budget.
+        globals()["LOG"] = os.path.join(_td, "soak.log")
+        wlog("seed")
+        for i in range(500):
+            wlog(f"poll {i}: no rule match: app='Some App' bin='/usr/bin/some-app'")
+        check("wlog: soak keeps the current generation bounded",
+              os.path.getsize(LOG) <= LOG_MAX_BYTES, True)
+        check("wlog: soak keeps the previous generation bounded",
+              os.path.getsize(LOG + ".1") <= LOG_MAX_BYTES, True)
+        check("wlog: soak total footprint is bounded",
+              os.path.getsize(LOG) + os.path.getsize(LOG + ".1") <= 2 * LOG_MAX_BYTES, True)
+        check("wlog: soak kept the newest line", "poll 499" in open(LOG, encoding="utf-8").read(), True)
+
+        # A single pathological line must not be able to exceed the cap.
+        wlog("x" * (LOG_MAX_BYTES * 4))
+        check("wlog: oversized line is truncated", os.path.getsize(LOG) < LOG_MAX_BYTES, True)
+        check("wlog: oversized line is marked", "truncated" in open(LOG, encoding="utf-8").read(), True)
+
+        # A log that cannot be written must never take the watcher down.
+        globals()["LOG"] = os.path.join(_td, "no-such-dir", "watch.log")
+        wlog("into the void")
+        check("wlog: survives an unwritable path", True, True)
+    finally:
+        globals()["LOG"] = _real_log
+        globals()["LOG_MAX_BYTES"] = _real_cap
+        for _f in (os.path.join(_td, "watch.log"), os.path.join(_td, "watch.log.1"),
+               os.path.join(_td, "soak.log"), os.path.join(_td, "soak.log.1")):
+            try:
+                os.unlink(_f)
+            except OSError:
+                pass
+        try:
+            os.rmdir(_td)
+        except OSError:
+            pass
+    check("wlog: restored the real log path", LOG, _real_log)
+    check("wlog: restored the real cap", LOG_MAX_BYTES, _real_cap)
+    check("wlog: cap is a sane size", 16 * 1024 <= LOG_MAX_BYTES <= 4 * 1024 * 1024, True)
+
+    # --- hardening: permissions, lock fallback, corrupt-once -------------
+    # The state file caches Bluetooth device names and MACs, which is
+    # identifying information; it was 0644 (world-readable) while the rules
+    # beside it were already 0600.
+    _td2 = tempfile.mkdtemp()
+    _real_store, _real_state, _real_lock = STORE, STATE, LOCK
+    try:
+        globals()["STORE"] = os.path.join(_td2, "router-rules.json")
+        globals()["STATE"] = os.path.join(_td2, "petealeon-router.json")
+        globals()["LOCK"] = os.path.join(_td2, "store.lock")
+
+        def set_pref(obj):
+            return {**obj, "routing_enabled": False}
+
+        check("modify_state: wrote the preference", modify_state(set_pref), True)
+        _mode = os.stat(STATE).st_mode & 0o777
+        check("modify_state: state file is 0600", oct(_mode), oct(0o600))
+        check("modify_state: state file is not group or world readable", _mode & 0o077, 0)
+        check("modify_state: no temp file left behind",
+              [f for f in os.listdir(_td2) if ".tmp." in f], [])
+        check("modify_state: lock was created", os.path.exists(LOCK), True)
+        check("load_state: reads back the preference", load_state().get("routing_enabled"), False)
+
+        # The rules store keeps its own 0600.
+        write_rules([{"app": "mpv", "binary": "mpv", "node": "", "sink": target}])
+        check("write_rules: rules file is 0600", oct(os.stat(STORE).st_mode & 0o777), oct(0o600))
+
+        # A lock that cannot be opened must refuse the write, not traceback.
+        # Primary in a directory that does not exist, store beside it in one
+        # that does: the fallback has to be usable or the write is refused.
+        os.makedirs(os.path.join(_td2, "nested", "deep"), exist_ok=True)
+        globals()["LOCK"] = os.path.join(_td2, "absent-dir", "store.lock")
+        globals()["STORE"] = os.path.join(_td2, "nested", "deep", "router-rules.json")
+        _fb = open_lock()
+        check("open_lock: falls back beside the store", _fb is not None, True)
+        if _fb is not None:
+            check("open_lock: fallback landed beside the store",
+                  os.path.dirname(os.path.abspath(_fb.name)),
+                  os.path.join(_td2, "nested", "deep"))
+            _fb.close()
+        # A fresh install has no store directory at all, and must still be able
+        # to write: modify_store creates the directory before looking for a
+        # lock, because the fallback lock lives inside it.
+        _fresh = os.path.join(_td2, "brand", "new", "dir", "router-rules.json")
+        globals()["STORE"] = _fresh
+        globals()["LOCK"] = os.path.join(_td2, "absent-dir", "store.lock")
+        check("modify_store: no store directory to begin with",
+              os.path.isdir(os.path.dirname(_fresh)), False)
+        check("modify_store: writes on a fresh install",
+              modify_store(lambda rs: rs + [{"app": "fresh", "binary": "fresh", "node": "", "sink": "y"}]), True)
+        check("modify_store: created the store directory", os.path.isdir(os.path.dirname(_fresh)), True)
+        check("modify_store: the fresh write landed", os.path.isfile(_fresh), True)
+        globals()["STORE"] = os.path.join("/proc", "definitely-not-writable", "router-rules.json")
+        globals()["STATE"] = os.path.join("/proc", "definitely-not-writable", "petealeon-router.json")
+        check("open_lock: returns None when nothing is usable", open_lock(), None)
+        check("modify_store: refuses rather than raising",
+              modify_store(lambda rs: rs + [{"app": "x", "binary": "x", "node": "", "sink": "y"}]), False)
+        # STATE, not STORE: pointing only STORE at an unwritable path would let
+        # this pass without ever reaching the failure.
+        check("modify_state: refuses rather than raising", modify_state(set_pref), False)
+        check("modify_state: left the real state file alone",
+              os.path.isfile(os.path.join(_td2, "petealeon-router.json")), True)
+        check("read_store_locked: still returns a list when no lock is usable",
+              isinstance(read_store_locked(), list), True)
+        os.chmod(_td2, 0o700)
+
+        # A corrupt store must be preserved once, not retried every poll.
+        globals()["STORE"] = os.path.join(_td2, "corrupt.json")
+        globals()["LOCK"] = os.path.join(_td2, "store.lock")
+        with open(STORE, "w", encoding="utf-8") as f:
+            f.write("{not json at all")
+        _CORRUPT_REPORTED[0] = False
+        STORE_ISSUE[0] = ""
+        check("load_rules: corrupt returns empty", load_rules(), [])
+        check("load_rules: corrupt file preserved",
+              any(f.startswith("corrupt.json.corrupt.") for f in os.listdir(_td2)), True)
+        check("load_rules: issue names the backup", "preserved as" in STORE_ISSUE[0], True)
+        _first_issue = STORE_ISSUE[0]
+        # Recreate the corrupt file: the second read must NOT rename again.
+        with open(STORE, "w", encoding="utf-8") as f:
+            f.write("{still not json")
+        check("load_rules: second read returns empty", load_rules(), [])
+        check("load_rules: not preserved twice",
+              len([f for f in os.listdir(_td2) if f.startswith("corrupt.json.corrupt.")]), 1)
+        # And it must not keep claiming a backup exists when none was made.
+        _CORRUPT_REPORTED[0] = True
+        with open(STORE, "w", encoding="utf-8") as f:
+            f.write("{not json again")
+        check("load_rules: does not claim a backup it did not make",
+              "preserved as" in STORE_ISSUE[0], False)
+        check("load_rules: tells the user the file was left in place",
+              "left in place" in STORE_ISSUE[0], True)
+    finally:
+        globals()["STORE"], globals()["STATE"], globals()["LOCK"] = _real_store, _real_state, _real_lock
+        try:
+            os.chmod(_td2, 0o700)
+        except OSError:
+            pass
+        for _root, _dirs, _files in os.walk(_td2, topdown=False):
+            for _f in _files:
+                try:
+                    os.unlink(os.path.join(_root, _f))
+                except OSError:
+                    pass
+            for _d in _dirs:
+                try:
+                    os.rmdir(os.path.join(_root, _d))
+                except OSError:
+                    pass
+        try:
+            os.rmdir(_td2)
+        except OSError:
+            pass
+
+    check("bluetooth_profile_index absent", bluetooth_profile_index("bluez_output.24_06_11_A5_E7_95"), 0)
+    check("bluetooth_profile_index empty", bluetooth_profile_index(""), 0)
+    check("bluetooth_profile_index None", bluetooth_profile_index(None), 0)
 
     rules = [
         {"app": "Brave", "binary": "brave", "node": "", "sink": target},
@@ -1164,6 +1868,175 @@ def selftest():
     # should only be rewritten when it really is one.
     check("mac_from_sink rejects near-miss", mac_from_sink("bluez_output.not-a-mac.1"), None)
     check("mac_from_sink rejects prefix abuse", mac_from_sink("bluez_output.1.2bluez_output.aa"), None)
+
+    # --- one bad byte must not blank the whole panel ---------------------
+    # These pin decode_output directly, so the policy is verified with no
+    # subprocess and no pactl. The old code passed text=True with no error
+    # handler: a single invalid sequence raised inside the decode, run()
+    # swallowed it into "", and the entire list payload went empty.
+    #
+    # decoded() routes every assertion through the exception boundary: without
+    # it a regression to strict decoding raises out of the first case and kills
+    # the whole suite, which reports no result at all instead of naming the
+    # check that broke.
+    def decoded(raw):
+        try:
+            return decode_output(raw)
+        except Exception as ex:
+            return f"raised {type(ex).__name__}"
+
+    check("decode plain ascii", decoded(b"Sink #0"), "Sink #0")
+    check("decode valid utf-8 accents", decoded("café 🎧 日本語".encode("utf-8")), "café 🎧 日本語")
+    check("decode empty bytes", decoded(b""), "")
+    check("decode None", decoded(None), "")
+    check("decode lone invalid byte", decoded(b"\xff"), "\ufffd")
+    # latin-1 e-acute: valid as latin-1, not a valid UTF-8 sequence.
+    check("decode latin-1 byte is replaced", decoded(b"\xe9"), "\ufffd")
+    check("decode truncated multibyte is replaced", decoded("é".encode("utf-8")[:-1]), "\ufffd")
+    # The property that actually matters: a bad byte inside a device name
+    # costs that one name, not the whole document.
+    check("decode keeps payload around a bad byte",
+          decoded(b"Sink #0\n\tname = My \xff Speaker\nSink #1\n\tname = Fine\n"),
+          "Sink #0\n\tname = My \ufffd Speaker\nSink #1\n\tname = Fine\n")
+    check("decode bad byte at start", decoded(b"\xffname = Fine\n"), "\ufffdname = Fine\n")
+    check("decode bad byte at end", decoded(b"name = Fine\n\xff"), "name = Fine\n\ufffd")
+    # Every byte value, one at a time: no lone value may raise.
+    check("decode survives all single bytes",
+          all(decoded(bytes([i])) is not None for i in range(256)), True)
+    check("decode full byte range is total", len(decoded(bytes(range(256)))), 256)
+
+    # decode_output is only half the fix: run() has to actually route through
+    # it. Testing the helper alone would still pass if someone reinstated
+    # text=True, because the function would keep working while nothing called
+    # it. These drive run() itself against a stubbed subprocess, so the suite
+    # still runs with no real process and no pactl.
+    class _Completed:
+        def __init__(self, stdout):
+            self.stdout = stdout
+
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen.clear()
+        seen.update(kwargs)
+        return _Completed(b"name = My \xff Speaker\n")
+
+    real_subprocess_run = subprocess.run
+    try:
+        subprocess.run = fake_run
+        check("run() decodes through the replacement policy",
+              run(["ignored"]), "name = My \ufffd Speaker\n")
+        # Pin the actual fix at its source: capture bytes, never text mode.
+        # text=True or an explicit encoding restores the whole bug, because
+        # Python's own decoder is strict about the same bytes.
+        check("run() captures bytes, not text", seen.get("text"), None)
+        check("run() sets no explicit encoding", seen.get("encoding"), None)
+        check("run() captures stdout", seen.get("capture_output"), True)
+    finally:
+        subprocess.run = real_subprocess_run
+
+    def exploding_run(cmd, **kwargs):
+        raise OSError("no such command")
+
+    try:
+        subprocess.run = exploding_run
+        check("run() still swallows spawn failure", run(["ignored"]), "")
+    finally:
+        subprocess.run = real_subprocess_run
+
+    # A timeout is a spawn-level failure too: the caller gets "" and the panel
+    # keeps its last good state rather than a traceback.
+    try:
+        subprocess.run = lambda cmd, **kw: (_ for _ in ()).throw(subprocess.TimeoutExpired(cmd, kw.get("timeout")))
+        check("run() swallows timeout", run(["ignored"]), "")
+    finally:
+        subprocess.run = real_subprocess_run
+    check("run() left the real subprocess.run in place", subprocess.run is real_subprocess_run, True)
+
+
+    # The bug this pins: EXCLUDE_APPS held "Quickshell" and "wireplumber" while
+    # pactl reports "quickshell" and "WirePlumber". Case-sensitive membership
+    # matched neither, so both appeared as steerable rows and both counted as
+    # valid inputs for the watcher and for restore.
+    for name in ("WirePlumber", "wireplumber", "quickshell", "Quickshell",
+                 "EasyEffects", "easyeffects", "pipewire", "PIPEWIRE",
+                 "systemd", "pactl", "pw-dump", "python3",
+                 "xdg-desktop-portal", "xdg-desktop-portal-hyprland"):
+        check(f"excluded: {name}", is_excluded_app(name), True)
+    for name in ("Brave", "mpv", "Signal input", "ringrtc", "firefox", "Steam"):
+        check(f"not excluded: {name}", is_excluded_app(name), False)
+    check("excluded: empty name is not excluded", is_excluded_app(""), False)
+    check("excluded: None is not excluded", is_excluded_app(None), False)
+    # What restore and the watcher actually consult.
+    check("is_valid_input rejects WirePlumber", is_valid_input({"appName": "WirePlumber"}), False)
+    check("is_valid_input rejects quickshell", is_valid_input({"appName": "quickshell"}), False)
+    check("is_valid_input accepts Brave", is_valid_input({"appName": "Brave"}), True)
+    # A live session reports the same binary twice, once tagged. The exact
+    # spellings below are what `pactl list clients` produced here, so this is
+    # the check that the audio stack is actually unsteerable on this machine,
+    # not just in a fixture.
+    for tagged in ("WirePlumber [client]", "quickshell [client]", "pipewire [client]",
+                   "pactl [client]", "EasyEffects [client]"):
+        check(f"excluded: tagged {tagged!r}", is_excluded_app(tagged), True)
+        check(f"is_valid_input rejects tagged {tagged!r}",
+              is_valid_input({"appName": tagged, "binary": ""}), False)
+    check("norm_client_name strips a client tag", norm_client_name("WirePlumber [client]"), "wireplumber")
+    check("norm_client_name strips a spaced tag", norm_client_name("  quickshell  [client]  "), "quickshell")
+    check("norm_client_name leaves a plain name", norm_client_name("Brave input"), "brave input")
+    check("norm_client_name leaves an empty name", norm_client_name(""), "")
+    check("norm_client_name tolerates None", norm_client_name(None), "")
+    check("norm_client_name leaves an inner bracket", norm_client_name("App [a] b"), "app [a] b")
+    check("norm_client_name leaves a long bracket alone", norm_client_name("x" * 80 + " [client]")[0], "x")
+    # Binary is checked too: an unfamiliar appName does not make a wireplumber
+    # stream safe to move, and Panel.qml already filtered rows on the binary.
+    check("is_excluded_client by binary despite the appName",
+          is_excluded_client({"appName": "Mystery", "binary": "/usr/bin/wireplumber"}), True)
+    check("is_excluded_client by binary only",
+          is_excluded_client({"appName": "", "binary": "/usr/bin/pipewire"}), True)
+    check("is_excluded_client for a real app is False",
+          is_excluded_client({"appName": "Brave input", "binary": "/usr/lib/brave-bin/brave"}), False)
+    check("is_excluded_client for signal is False",
+          is_excluded_client({"appName": "ringrtc", "binary": "/opt/signal-desktop/signal-desktop"}), False)
+    check("is_excluded_client tolerates missing fields", is_excluded_client({}), False)
+    check("is_valid_input accepts a real app with a path binary",
+          is_valid_input({"appName": "Brave input", "binary": "/usr/lib/brave-bin/brave"}), True)
+    # The binary check has to be reached through the callers too, not only
+    # through is_excluded_client directly: a stack stream that reports an
+    # unfamiliar appName must still be refused by the code that actually decides.
+    check("is_valid_input refuses on the binary alone",
+          is_valid_input({"appName": "Mystery", "binary": "/usr/bin/wireplumber"}), False)
+    check("is_valid_input refuses a tagged name with an empty binary",
+          is_valid_input({"appName": "WirePlumber [client]", "binary": ""}), False)
+    # parse_clients is the other caller, and it decides what the panel offers.
+    _mixed = """Client #11
+\tapplication.name = "Mystery"
+\tapplication.process.binary = "/usr/bin/wireplumber"
+Client #12
+\tapplication.name = "Brave input"
+\tapplication.process.binary = "/usr/lib/brave-bin/brave"
+Client #13
+\tapplication.name = "quickshell [client]"
+\tapplication.process.binary = "/usr/bin/quickshell"
+"""
+    check("parse_clients drops a stack client by binary",
+          [c["appName"] for c in parse_clients(_mixed)], ["Brave input"])
+
+    # The same policy is duplicated in Panel.qml so the panel can hide rows
+    # without a round trip. Two copies of one policy drift, which is exactly
+    # how the case bug above survived, so read that list back and compare.
+    # Panel.qml sits beside the helper's directory in both supported layouts:
+    # <repo>/Panel.qml next to <repo>/assets/, and the installed plugin dir.
+    panel_qml = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "Panel.qml"))
+    try:
+        with open(panel_qml, encoding="utf-8") as f:
+            qml_line = next((ln for ln in f if "var list = [" in ln), "")
+        qml_list = {norm(x) for x in re.findall(r'"([^"]+)"', qml_line)}
+        check("panel exclusion list matches EXCLUDE_APPS",
+              sorted(qml_list - EXCLUDE_APPS), sorted(EXCLUDE_APPS - qml_list))
+    except OSError as ex:
+        # Supported layouts always have it; failing loudly beats silently
+        # skipping the only guard against the two copies drifting apart.
+        check("panel exclusion list readable", f"unreadable: {ex}", "readable")
 
     failed = [name for name, ok in checks if not ok]
     print(f"selftest: {len(checks) - len(failed)}/{len(checks)} passed")

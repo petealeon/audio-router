@@ -2,9 +2,21 @@
   "schemaVersion": 1,
   "id": "petealeon.router",
   "name": "Audio Router",
-  "version": "1.3.2",
+  "version": "1.4.0",
   "author": "petealeon",
   "description": "Persistent per-app audio routing: link any app to any output from a dedicated two-column patchbay widget",
+  "license": "MIT",
+  "homepage": "https://github.com/petealeon/audio-router",
+  "repository": "https://github.com/petealeon/audio-router",
+  "keywords": [
+    "audio",
+    "routing",
+    "pipewire",
+    "pulseaudio",
+    "bluetooth",
+    "bar-widget",
+    "patchbay"
+  ],
   "kinds": [
     "bar-widget"
   ],

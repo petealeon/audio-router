@@ -125,6 +125,109 @@ def basename(p):
     return strip_deleted((p or "").rsplit("/", 1)[-1])
 
 
+# A bluetooth output sink is named after the device MAC plus a profile index:
+# bluez_output.24_06_11_A5_E7_95.1 -> 24:06:11:A5:E7:95. The index is optional
+# so a variant spelling still resolves, and matching on the device part means a
+# label survives the profile moving from .1 to .2.
+BLUETOOTH_SINK_RE = re.compile(r"^bluez_output\.([0-9A-Fa-f_]+)(?:\.\d+)?$")
+
+
+def mac_from_sink(name):
+    """The MAC behind a bluez_output sink name, or None for anything else."""
+    m = BLUETOOTH_SINK_RE.match((name or "").strip())
+    return m.group(1).replace("_", ":").upper() if m else None
+
+
+def bluetooth_labels():
+    """{MAC: name} for the devices BlueZ knows.
+
+    A bluez_output sink can only exist for a paired device, so BlueZ always has
+    a name for one — which is the whole point: the sink is gone from pactl
+    exactly when the user wants to see the name.
+
+    Returns None to mean "could not ask", deliberately distinct from {} meaning
+    "asked, knows nothing". Only the latter may be cached, or a bluetoothctl
+    that failed once (daemon restarting, package upgrading) would pin the raw
+    sink name for good.
+    """
+    if shutil.which("bluetoothctl") is None:
+        return None
+    out = run(["bluetoothctl", "devices"])
+    if not out.strip():
+        return None
+    labels = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[0] == "Device":
+            labels[parts[1].upper()] = " ".join(parts[2:])
+    return labels
+
+
+def resolve_sink_labels(sinks, rules):
+    """(labels, pending) for the sinks the panel may need to name.
+
+    `labels` maps sink name -> friendly name, covering every connected sink
+    (PipeWire's own Description) plus every sink a rule points at that pactl
+    does not currently report — which is how a disconnected bluetooth output
+    reaches the panel at all, and why its row would otherwise be labelled with
+    the raw bluez_output string.
+
+    Absent sinks resolve remembered-description first, then BlueZ by MAC, then
+    nothing: the panel applies its own last-resort formatting rather than being
+    handed a guess from here.
+
+    `pending` is what should be written to the state file: descriptions newly
+    seen, and BlueZ answers. Empty strings are included on purpose — they record
+    "asked, does not know" so the lookup runs at most once per device instead of
+    on every one of the panel's 1s polls. Nothing is returned for a lookup that
+    could not be made.
+    """
+    state = load_state()
+    remembered = state.get("sinkLabels")
+    remembered = remembered if isinstance(remembered, dict) else {}
+    tried = state.get("tried")
+    tried = set(tried) if isinstance(tried, list) else set()
+
+    labels, pending = {}, {}
+    for s in sinks:
+        desc = (s.get("desc") or "").strip()
+        if desc and desc != s["name"]:
+            labels[s["name"]] = desc
+            if remembered.get(s["name"]) != desc:
+                pending[s["name"]] = desc
+
+    present = {s["name"] for s in sinks}
+    absent = []
+    for r in rules:
+        name = r.get("sink") or ""
+        if name and name != "__default__" and name not in present and name not in absent:
+            absent.append(name)
+
+    table = None
+    for name in absent:
+        # `in remembered` rather than a truth test: a cached empty string means
+        # "asked, does not know" and must still be emitted, or the key would
+        # appear on one poll and vanish on the next, changing the payload shape
+        # every second and forcing a pointless panel rebuild.
+        if name in remembered:
+            labels[name] = remembered[name]
+            continue
+        if name in tried:
+            labels[name] = ""
+            continue
+        mac = mac_from_sink(name)
+        if mac is None:
+            continue
+        if table is None:
+            table = bluetooth_labels()
+            if table is None:
+                break  # could not ask: cache nothing, retry on a later poll
+        answer = table.get(mac, "")
+        labels[name] = answer
+        pending[name] = answer
+    return labels, pending
+
+
 # One-line diagnostics about the store, surfaced through `list`'s error field.
 # Mutable container so plain functions can set it without a `global` dance.
 STORE_ISSUE = [""]
@@ -420,12 +523,28 @@ def cmd_list():
     inputs = parse_inputs(inputs_raw, sink_by_index)
     clients = parse_clients(run(["pactl", "list", "clients"]))
     default_sink = run(["pactl", "get-default-sink"]).strip()
+    rules = load_rules()
+    labels, pending = resolve_sink_labels(sinks, rules)
+    if pending:
+        # `list` is a read, so this is a side effect worth stating plainly: it
+        # only happens when a label is genuinely new, and it is what lets a
+        # disconnected device be named later without asking BlueZ again.
+        def cache_labels(obj):
+            cache = obj.get("sinkLabels")
+            cache = dict(cache) if isinstance(cache, dict) else {}
+            cache.update(pending)
+            done = obj.get("tried")
+            done = set(done) if isinstance(done, list) else set()
+            return {**obj, "sinkLabels": cache, "tried": sorted(done | set(pending))}
+
+        modify_state(cache_labels)
     payload = {
         "sinks": sinks,
         "defaultSink": default_sink,
         "sinkInputs": [e for e in inputs if is_valid_input(e)],
         "clients": clients,
-        "rules": load_rules(),
+        "rules": rules,
+        "labels": labels,
     }
     issues = merge_issues(
         describe_issues(sinks_raw, shutil.which("pactl") is not None),
@@ -531,16 +650,58 @@ def cmd_restore():
         mark.close()
 
 
-def load_routing_state():
-    """Persisted on/off intent. Absent or unreadable means on: routing is the
-    default, and a corrupt preference file must not silently disable the
-    plugin."""
+def load_state():
+    """The whole state file. Missing, unreadable, or wrong-shaped reads as
+    empty: routing is on by default, a corrupt preference must not disable the
+    plugin, and losing the label cache is harmless (it refills)."""
     try:
         with open(STATE, "r", encoding="utf-8") as f:
             obj = json.load(f)
     except (OSError, ValueError):
-        return True
-    return bool(obj.get("routing_enabled", True))
+        return {}
+    return obj if isinstance(obj, dict) else {}
+
+
+def modify_state(mutator):
+    """Read-modify-write the state file under the store lock.
+
+    The on/off preference and the sink-label cache share this file and are
+    written from different places — a user toggle, and the 1s `list` poll — so
+    the write has to be a locked read-modify-write. Writing a whole document
+    instead would let the poll drop a preference the user had just toggled, and
+    vice versa. Refuses without the lock for the same reason modify_store does.
+    """
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    with open(LOCK, "w", encoding="utf-8") as fd:
+        if not acquire_ex(fd):
+            say("state lock unavailable — refusing write")
+            wlog("refused state write: lock unavailable after 5s")
+            return False
+        before = load_state()
+        after = mutator(dict(before))
+        if after == before:
+            return True
+        tmp = f"{STATE}.tmp.{os.getpid()}"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(after, f, indent=2)
+                f.write("\n")
+            os.replace(tmp, STATE)
+        except OSError as ex:
+            say(f"state: could not write {STATE}: {ex}")
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            return False
+    return True
+
+
+def load_routing_state():
+    """Persisted on/off intent. Absent or unreadable means on: routing is the
+    default, and a corrupt preference file must not silently disable the
+    plugin."""
+    return bool(load_state().get("routing_enabled", True))
 
 
 def cmd_routing_state():
@@ -554,19 +715,7 @@ def cmd_set_routing(value):
         sys.stdout.write("ROUTING_STATE error bad value\n")
         sys.stdout.flush()
         sys.exit(2)
-    os.makedirs(os.path.dirname(STATE), exist_ok=True)
-    tmp = f"{STATE}.tmp.{os.getpid()}"
-    try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"routing_enabled": want == "on"}, f, indent=2)
-            f.write("\n")
-        os.replace(tmp, STATE)
-    except OSError as ex:
-        say(f"set-routing: could not write {STATE}: {ex}")
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
+    if not modify_state(lambda obj: {**obj, "routing_enabled": want == "on"}):
         sys.stdout.write("ROUTING_STATE error could not write\n")
         sys.stdout.flush()
         sys.exit(1)
@@ -745,7 +894,7 @@ def selftest():
 
     # Swapped out (and restored in a finally) for the set-rule store/move
     # separation checks further down.
-    global modify_store, move_matching, run
+    global modify_store, move_matching, run, load_state, bluetooth_labels
 
     def check(name, got, want):
         ok = got == want
@@ -911,6 +1060,24 @@ def selftest():
             json.dump({"something_else": 1}, f)
         check("routing-state: missing key falls back to on", load_routing_state(), True)
 
+        # Toggling and the 1s `list` poll write the same file, so the toggle has
+        # to be a read-modify-write: writing a whole document would let a
+        # poll-side label cache write drop the preference, and the other way
+        # round. Regression guard for exactly that.
+        with open(tmp_state, "w", encoding="utf-8") as f:
+            json.dump({"routing_enabled": True,
+                       "sinkLabels": {"bluez_output.24_06_11_A5_E7_95.1": "MOONDROP BLOCK"},
+                       "tried": ["bluez_output.24_06_11_A5_E7_95.1"]}, f)
+        cmd_set_routing("off")
+        kept = load_state()
+        check("set-routing: preserved sinkLabels", kept.get("sinkLabels"),
+              {"bluez_output.24_06_11_A5_E7_95.1": "MOONDROP BLOCK"})
+        check("set-routing: preserved tried", kept.get("tried"),
+              ["bluez_output.24_06_11_A5_E7_95.1"])
+        check("set-routing: applied the toggle", kept.get("routing_enabled"), False)
+        check("routing-state: off after label carry-over", load_routing_state(), False)
+        cmd_set_routing("on")
+
         real_stdout = sys.stdout
         try:
             # Swallow the token/say output: this check is about the exit code,
@@ -929,6 +1096,74 @@ def selftest():
             os.unlink(tmp_state)
         except OSError:
             pass
+
+    # Friendly names for outputs a rule still points at but pactl no longer
+    # reports — how a disconnected bluetooth device reaches the panel. The
+    # state file and BlueZ are both stubbed, so still no I/O.
+    real_load_state, real_bluetooth_labels = load_state, bluetooth_labels
+    bt_calls = []
+
+    def fake_bluetooth_labels():
+        bt_calls.append(1)
+        return {"24:06:11:A5:E7:95": "MOONDROP BLOCK",
+                "23:10:18:B3:17:FD": "Moondrop Space Travel"}
+
+    try:
+        load_state = lambda: {}
+        bluetooth_labels = fake_bluetooth_labels
+        absent_bt = "bluez_output.23_10_18_B3_17_FD.1"
+        absent_unk = "bluez_output.99_99_99_99_99_99.1"
+        absent_wired = "alsa_output.usb-Feeding_The_Loop_USB_Audio-00.analog-stereo"
+        absent_rules = [{"app": "a", "binary": "a", "node": "", "sink": absent_bt},
+                        {"app": "b", "binary": "b", "node": "", "sink": absent_unk},
+                        {"app": "c", "binary": "c", "node": "", "sink": absent_wired}]
+
+        labels, pending = resolve_sink_labels(sinks, absent_rules)
+        check("labels: connected sink uses PipeWire description",
+              labels[target], "WH-1000XM4")
+        check("labels: absent bluetooth resolved via BlueZ", labels[absent_bt], "Moondrop Space Travel")
+        check("labels: BlueZ asked once for all lookups", len(bt_calls), 1)
+        check("labels: unknown bluetooth cached as empty", pending[absent_unk], "")
+        check("labels: absent wired left unresolved", absent_wired in labels, False)
+        check("labels: connected sink's description cached on first sight", pending[target], "WH-1000XM4")
+
+        # Second poll, after the cache is persisted. resolve_sink_labels is
+        # pure, so the caller writes; simulate that and confirm nothing is
+        # re-asked and the payload shape does not change between polls.
+        state = {"sinkLabels": dict(pending, **{target: "WH-1000XM4"}),
+                 "tried": sorted(set(pending) | {target})}
+        load_state = lambda: dict(state)
+        bluetooth_labels = lambda: None
+        labels2, pending2 = resolve_sink_labels(sinks, absent_rules)
+        check("labels: second poll asks BlueZ again", len(bt_calls), 1)
+        check("labels: second poll has nothing to persist", pending2, {})
+        check("labels: second poll identical to first", labels2, labels)
+        check("labels: remembered description reused without asking BlueZ",
+              labels2[absent_bt], "Moondrop Space Travel")
+
+        # A bluetoothctl that fails must not poison the cache: "could not ask"
+        # is a different answer from "asked, knows nothing", and only the
+        # latter may be remembered. Seed the connected sinks so the assertion
+        # is about the failed lookup and nothing else.
+        state = {"sinkLabels": {s["name"]: s["desc"] for s in sinks}, "tried": []}
+        load_state = lambda: dict(state)
+        labels3, pending3 = resolve_sink_labels(sinks, absent_rules)
+        check("labels: failed lookup yields no cacheable answer", pending3, {})
+        check("labels: failed lookup invents no label", absent_bt in labels3, False)
+    finally:
+        load_state, bluetooth_labels = real_load_state, real_bluetooth_labels
+
+    check("mac_from_sink profile 1", mac_from_sink("bluez_output.24_06_11_A5_E7_95.1"), "24:06:11:A5:E7:95")
+    check("mac_from_sink profile 2", mac_from_sink("bluez_output.24_06_11_A5_E7_95.2"), "24:06:11:A5:E7:95")
+    check("mac_from_sink no profile", mac_from_sink("bluez_output.24_06_11_A5_E7_95"), "24:06:11:A5:E7:95")
+    check("mac_from_sink lowercase", mac_from_sink("bluez_output.aa_bb_cc_dd_ee_ff.1"), "AA:BB:CC:DD:EE:FF")
+    check("mac_from_sink alsa", mac_from_sink("alsa_output.pci-0000_00_1f.3.analog-stereo"), None)
+    check("mac_from_sink empty", mac_from_sink(""), None)
+    check("mac_from_sink None", mac_from_sink(None), None)
+    # A lookalike must not be mistaken for a bluetooth sink: the identifier
+    # should only be rewritten when it really is one.
+    check("mac_from_sink rejects near-miss", mac_from_sink("bluez_output.not-a-mac.1"), None)
+    check("mac_from_sink rejects prefix abuse", mac_from_sink("bluez_output.1.2bluez_output.aa"), None)
 
     failed = [name for name, ok in checks if not ok]
     print(f"selftest: {len(checks) - len(failed)}/{len(checks)} passed")

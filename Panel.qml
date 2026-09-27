@@ -151,6 +151,9 @@ Panel {
   property var sinkInputs: []
   property var clients: []
   property var rules: []
+  // Best known name per sink, including sinks pactl no longer reports (see
+  // Model.friendlySinkName for the last-resort formatting).
+  property var sinkLabels: ({})
   property var pendingWrites: []
   property string defaultSinkName: ""
   property string stateSignature: ""
@@ -341,7 +344,8 @@ Panel {
       obj.sinkInputs.map(function(i2) { return [i2.id, i2.sink, i2.sinkName] }),
       obj.rules,
       stableCl,
-      obj.defaultSink || ""
+      obj.defaultSink || "",
+      obj.labels || {}
     ])
     if (sig === root.stateSignature) return
     root.stateSignature = sig
@@ -349,6 +353,7 @@ Panel {
     root.sinkInputs = obj.sinkInputs || []
     root.clients = obj.clients || []
     root.rules = obj.rules || []
+    root.sinkLabels = obj.labels || {}
     root.prunePendingWrites()
     root.defaultSinkName = obj.defaultSink || ""
     root.stateLoaded = true
@@ -504,7 +509,11 @@ Panel {
       var r2 = effective2[i]
       if (!r2.sink || r2.sink === "__default__") continue
       if (sinkKeys[r2.sink]) continue
-      outRows.push({ key: r2.sink, label: r2.sink, sub: "offline", isDefault: false, available: false, offline: true })
+      // An output a rule still points at but pactl no longer reports: a
+      // disconnected bluetooth device, or an unplugged one. Name it from what
+      // we last saw, not from the identifier, and leave it marked unavailable so
+      // it renders ghosted.
+      outRows.push({ key: r2.sink, label: root.sinkLabels[r2.sink] || Model.friendlySinkName(r2.sink), sub: "offline", isDefault: false, available: false, offline: true })
       sinkKeys[r2.sink] = 1
     }
     var outSig = JSON.stringify(outRows.map(function(o) {

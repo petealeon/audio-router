@@ -72,6 +72,33 @@ check("unrelated similar name is left alone", context.basename("brave-deleted"),
 // the suffix never matches. Pre-existing, and harmless.
 check("bare input suffix is trimmed, not emptied", context.stripInput(" input"), "input")
 
+// Last-resort naming for an output pactl no longer reports, which is how a
+// disconnected bluetooth device shows up: a rule still points at the sink, so
+// the panel keeps a row for it, and without a label that row read
+// "bluez_output.24_06_11_A5_E7_95.1". The MAC is what makes it matchable to a
+// device by hand.
+check("bluetooth sink name becomes a readable label",
+  context.friendlySinkName("bluez_output.24_06_11_A5_E7_95.1"), "Bluetooth 24:06:11:A5:E7:95")
+check("bluetooth profile suffix ignored",
+  context.friendlySinkName("bluez_output.24_06_11_A5_E7_95.2"), "Bluetooth 24:06:11:A5:E7:95")
+check("bluetooth name without a profile suffix",
+  context.friendlySinkName("bluez_output.aa_bb_cc_dd_ee_ff"), "Bluetooth AA:BB:CC:DD:EE:FF")
+check("lowercase mac uppercased",
+  context.friendlySinkName("bluez_output.AA_BB_CC_DD_EE_FF.1"), "Bluetooth AA:BB:CC:DD:EE:FF")
+// Only bluetooth is rewritten. alsa/USB names vary per device and per driver,
+// so inventing a parse would produce confident nonsense; the raw name is
+// returned untouched instead.
+check("alsa name passed through unchanged",
+  context.friendlySinkName("alsa_output.pci-0000_00_1f.3.analog-stereo"),
+  "alsa_output.pci-0000_00_1f.3.analog-stereo")
+check("usb name passed through unchanged",
+  context.friendlySinkName("alsa_output.usb-Generic_ThinkPad_Dock_USB_Audio-00.analog-stereo"),
+  "alsa_output.usb-Generic_ThinkPad_Dock_USB_Audio-00.analog-stereo")
+check("near-miss bluetooth name is not rewritten",
+  context.friendlySinkName("bluez_output.not-a-mac.1"), "bluez_output.not-a-mac.1")
+check("empty label for empty name", context.friendlySinkName(""), "")
+check("empty label for null name", context.friendlySinkName(null), "")
+
 const failed = checks.filter(([, ok]) => !ok)
 console.log(`model-test: ${checks.length - failed.length}/${checks.length} passed`)
 process.exit(failed.length ? 1 : 0)

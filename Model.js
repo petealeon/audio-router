@@ -2,9 +2,13 @@
 //
 // Contract with assets/omarchy-router list:
 //   { sinks:[{index,name,desc,available}], defaultSink, sinkInputs:[{id,appName,binary,nodeName,sink,sinkName}],
-//     clients:[{appName,binary}], rules:[{app,binary,sink}] }
+//     clients:[{appName,binary}], rules:[{app,binary,sink}],
+//     labels:{sinkName: friendlyName} }
 // rule.sink is the output NAME (or "__default__").
 // binary values are already basenames.
+// labels maps sink name to the best name we have for it, and covers rule sinks
+// that pactl no longer reports — the disconnected-device case. A key present
+// with an empty value means "asked, and nothing knows it".
 
 function basename(p) {
   p = String(p || "")
@@ -86,6 +90,20 @@ function ruleForRow(row, rulesList) {
     if (key === ruleKey(r)) return r
   }
   return null
+}
+
+// Last resort for a sink that has no remembered description and that BlueZ does
+// not know: turn the identifier into something a person can recognise and
+// match to a device. Only bluetooth is rewritten. alsa/USB sink names vary per
+// device and per driver, so a speculative parse would produce confident
+// nonsense; those keep their raw name, which is at least self-explanatory.
+//
+//   bluez_output.24_06_11_A5_E7_95.1  ->  "Bluetooth 24:06:11:A5:E7:95"
+function friendlySinkName(name) {
+  var s = String(name || "").trim()
+  var m = /^bluez_output\.([0-9A-Fa-f_]+)(?:\.\d+)?$/.exec(s)
+  if (!m) return s
+  return "Bluetooth " + m[1].replace(/_/g, ":").toUpperCase()
 }
 
 function groupKeyed(entries, keyer) {

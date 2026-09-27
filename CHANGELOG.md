@@ -3,6 +3,36 @@
 All notable changes to `petealeon.router` are documented here. SemVer; releases are
 tagged `vX.Y.Z`.
 
+## [1.3.2] - 2026-09-27
+
+### Fixed
+- **A disconnected Bluetooth output is now named, not shown as a raw sink
+  identifier.** An output a rule still points at but PipeWire no longer reports
+  — a Bluetooth device that has disconnected, or a dock that has been
+  unplugged — kept a row in the panel, and that row was labelled with the sink
+  name itself, so the Bluetooth entry read `bluez_output.24_06_11_A5_E7_95.1`.
+  This was the most visible symptom because a disconnected device is not in
+  `pactl list sinks` at all, so this row is the *only* place it could appear.
+
+  The row now carries the device name, for example `MOONDROP BLOCK`, resolved in
+  the order that costs the least: the description PipeWire last reported for
+  that sink, captured while it was connected, then a one-time lookup of the MAC
+  embedded in the sink name against BlueZ, then a last-resort
+  `Bluetooth 24:06:11:A5:E7:95`. Nothing about the routing key changes, so rules
+  and the routing-off switch are unaffected, and the row stays ghosted and
+  marked `offline` exactly as before.
+
+### Notes
+- The remembered names and the lookup results are cached in
+  `~/.config/omarchy/petealeon-router.json`, and the on/off preference now shares
+  that file with a locked read-modify-write so a toggle and a background poll
+  cannot overwrite each other. A Bluetooth lookup that *fails* is not cached, so
+  a `bluetoothctl` that was briefly unavailable does not pin the raw name.
+  `--purge` already removed this file.
+- Only Bluetooth sink names are rewritten. `alsa_output.*` and USB names vary per
+  device and driver, so those rows keep their raw name rather than risk a
+  confident misparse.
+
 ## [1.3.1] - 2026-09-27
 
 ### Fixed

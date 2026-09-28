@@ -988,8 +988,14 @@ Panel {
     var pad = Style.space(12)
     if (outputRepeater.count === 0) return null
     if (x < outCol.x - pad || x > outCol.x + outCol.width + pad) return null
-    if (y < 0 || y >= root.outputRows.length * root.rowStep) return null
-    var idx = Math.floor(y / root.rowStep)
+    // outRowStep, not rowStep: the two columns' rows are independently sized,
+    // and outputAt above divides the same y by outRowStep. Using rowStep here
+    // meant a snap drop landing outside the real row — or short of the last one
+    // — whenever the source rows happened to be taller or shorter than the
+    // output rows, so the drag snapped to the wrong output. Which row is hit
+    // must not depend on how tall the other column is.
+    if (y < 0 || y >= root.outputRows.length * root.outRowStep) return null
+    var idx = Math.floor(y / root.outRowStep)
     if (idx >= root.outputRows.length) return null
     var key = root.outputRows[idx].key
     if (key === "__default__") return null

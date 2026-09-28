@@ -3,8 +3,10 @@
 Draft for the Omarchy plugin marketplace (plugins.omarchy.org). Paste into the
 [submit form](https://plugins.omarchy.org/publish).
 
-Status: **not submitted yet.** Nothing in this repository claims the plugin is
-listed, and the README says so explicitly.
+Status: **not submitted yet.** This file is the only place that says so — the
+README deliberately says nothing about marketplace status, so a reader's first
+impression of the plugin is the plugin rather than its distribution. Nothing in
+this repository claims the plugin is listed.
 
 ## Checklist (all must be true before submitting)
 

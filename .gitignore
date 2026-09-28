@@ -6,3 +6,8 @@ router-rules.json
 # Python
 __pycache__/
 *.pyc
+
+# Agent-facing notes: machine-specific and deliberately untracked. The file
+# still works for whoever has it; install.sh deploys a fixed file list, so it
+# would never ship with the plugin either way.
+AGENTS.md

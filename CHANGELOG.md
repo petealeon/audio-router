@@ -3,6 +3,50 @@
 All notable changes to `petealeon.router` are documented here. SemVer; releases are
 tagged `vX.Y.Z`.
 
+## [1.4.2] - 2026-09-28
+
+A malformed rule file could silence the whole panel, and a crashed watcher
+could report itself as switched off.
+
+### Fixed
+- **One bad entry in `router-rules.json` could blank the entire panel.** The
+  helper checked that the file's root was a list, but not what was inside it,
+  while every consumer went on to call `.get()` on each element as a rule. A
+  store containing a bare string, number, `null` or nested list — a hand-edit, a
+  bad merge, or anything else that wrote valid JSON of the wrong shape — raised
+  `AttributeError` inside rule matching. That took down `list`, `set-sink` and
+  the watcher's re-assert together, and the panel's only symptom was an empty
+  patchbay with nothing in the log to say why. Entries that are not rule objects
+  are now ignored, every remaining rule keeps working, and the panel reports how
+  many entries were skipped. **The file on disk is left exactly as written**:
+  the bad entry is not silently deleted, so nothing is lost by fixing it by
+  hand, and the rest of your rules survive in the meantime.
+
+- **A killed watcher was reported as a clean shutdown.** The watcher's stderr
+  carries a marker saying *why* it exited, and arrives before the process-exit
+  signal that carries the code. The panel passed `0` — a clean exit — from that
+  first channel, so any death the helper had not deliberately marked (a `SIGKILL`
+  from the OOM killer, for instance) was classified as intentional: a 30-second
+  re-arm instead of the 3-second retry, and no charge against the five-restart
+  budget. A watcher crash-looping every few seconds therefore looked exactly like
+  a user who had switched routing off. That channel now passes no code at all,
+  and says only what it knows. The exit signal then supplies the real code, so
+  the two together classify the death correctly — and a crash now supersedes the
+  quiet re-arm if the two disagreed.
+
+- **A snap drop could land on the wrong output.** Dragging a source row snapped
+  to a row chosen with the *source* column's row height instead of the output
+  column's, and bounded its search by that height too. The two grids are sized
+  independently, so which output you got depended on how tall the other column's
+  rows happened to be — and a drop past the end of the last output was refused
+  outright. The output grid is measured the same way clicking it is measured.
+
+### Changed
+- The README no longer carries a marketplace section. Submission status is not
+  something a person who installed the plugin needs, and the end-user docs now
+  read as the tool rather than as its distribution. `docs/marketplace-submission.md`
+  remains the single place that tracks it.
+
 ## [1.4.1] - 2026-09-28
 
 One application could be listed twice, and one could be listed not at all.

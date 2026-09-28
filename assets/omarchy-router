@@ -323,10 +323,36 @@ def load_rules():
     try:
         with open(STORE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        if isinstance(data, list):
-            return data
-        STORE_ISSUE[0] = "router-rules.json root is not a list; treated as empty"
-        return []
+        if not isinstance(data, list):
+            STORE_ISSUE[0] = "router-rules.json root is not a list; treated as empty"
+            return []
+        # Elements are filtered, not validated-and-rejected. A list of dicts is
+        # what we write, so anything else is a hand-edit, a bad merge or a
+        # foreign writer. Every consumer below calls .get() on a rule, so one
+        # bare string in the list raised AttributeError inside identity_set --
+        # which killed `list`, `set-sink` and the watcher's re-assert alike. The
+        # panel then received no payload at all and showed a blank patchbay
+        # with nothing in the log to explain it. Keeping the good elements means
+        # one bad entry costs the user that entry and a visible warning, rather
+        # than every pin they had.
+        #
+        # The file on disk is left exactly as it is: dropping the element from
+        # the in-memory view is not the same as deleting the user's data, and
+        # only write_rules() is allowed to rewrite the store. A user who fixes
+        # the entry by hand keeps every other pin.
+        good = [r for r in data if isinstance(r, dict)]
+        if len(good) != len(data):
+            STORE_ISSUE[0] = (
+                f"router-rules.json holds {len(data) - len(good)} entry/entries that are not "
+                f"rule objects; ignored (the file itself is unchanged)"
+            )
+        else:
+            # Cleared, not left to persist. The watcher re-reads on every poll, so
+            # a user who fixed the entry by hand would otherwise keep seeing a
+            # complaint about a problem they had already resolved, until the
+            # shell was reloaded.
+            STORE_ISSUE[0] = ""
+        return good
     except FileNotFoundError:
         return []
     except Exception:
@@ -1744,6 +1770,62 @@ def selftest():
               "preserved as" in STORE_ISSUE[0], False)
         check("load_rules: tells the user the file was left in place",
               "left in place" in STORE_ISSUE[0], True)
+
+        # A well-formed list whose elements are not rule objects. This is the
+        # shape a hand-edit or a foreign writer leaves behind, and it used to
+        # raise AttributeError out of identity_set -- killing list, set-sink and
+        # the watcher together, leaving the panel blank with no diagnostic.
+        globals()["STORE"] = os.path.join(_td2, "mixed.json")
+        _mixed = [
+            {"app": "brave", "binary": "brave", "node": "", "sink": "alsa_output.b"},
+            "junk", 5, None, ["nested"], "",
+            {"app": "mpv", "binary": "mpv", "node": "mpv", "sink": "alsa_output.c"},
+        ]
+        with open(STORE, "w", encoding="utf-8") as f:
+            json.dump(_mixed, f)
+        STORE_ISSUE[0] = ""
+
+        def _survives(fn):
+            """True if `fn` runs. The consumers below are the point of the fix,
+            so they are asserted as 'did not raise' rather than on their return
+            value -- and wrapped, so that removing the filter reports a failing
+            check naming the consumer instead of a traceback from this suite."""
+            try:
+                fn()
+                return True
+            except Exception:
+                return False
+
+        _kept = load_rules()
+        check("load_rules: non-dict entries dropped, dicts kept",
+              [r.get("app") if isinstance(r, dict) else repr(r) for r in _kept],
+              ["brave", "mpv"])
+        check("load_rules: issue counts the ignored entries", "5" in STORE_ISSUE[0], True)
+        check("load_rules: issue says the file itself is unchanged",
+              "unchanged" in STORE_ISSUE[0], True)
+        # Every consumer calls .get() on a rule; each must survive now.
+        check("load_rules: identity_set survives a mixed store",
+              _survives(lambda: identity_set(_kept[0])), True)
+        check("load_rules: identities_overlap survives a mixed store",
+              _survives(lambda: identities_overlap({"appName": "mpv"}, _kept[1])), True)
+        check("load_rules: is_excluded_client survives a mixed store",
+              _survives(lambda: [is_excluded_client(r) for r in _kept]), True)
+        check("load_rules: sink_alias_map survives a mixed store",
+              _survives(lambda: sink_alias_map(_kept, {})), True)
+        check("load_rules: resolve_sink_labels survives a mixed store",
+              _survives(lambda: resolve_sink_labels([], _kept)), True)
+        check("load_rules: match_rule still finds a real rule",
+              (match_rule({"appName": "mpv", "binary": "mpv"}, _kept) or {}).get("sink"),
+              "alsa_output.c")
+        # The bytes on disk must be exactly what the user (or something else) wrote.
+        with open(STORE, "r", encoding="utf-8") as f:
+            check("load_rules: did not rewrite the user's file", json.load(f), _mixed)
+        # A clean store must not inherit a stale complaint from a previous read.
+        with open(STORE, "w", encoding="utf-8") as f:
+            json.dump([{"app": "mpv", "binary": "mpv", "node": "", "sink": "alsa_output.c"}], f)
+        STORE_ISSUE[0] = "stale message from an earlier read"
+        check("load_rules: clean store returns its rule", len(load_rules()), 1)
+        check("load_rules: clean store does not re-report", STORE_ISSUE[0], "")
     finally:
         globals()["STORE"], globals()["STATE"], globals()["LOCK"] = _real_store, _real_state, _real_lock
         try:
@@ -2421,6 +2503,18 @@ Client #13
         check("output hit-testing indexes by the output row step",
               bool(re.search(r"Math\.floor\(y\s*/\s*root\.outRowStep\)", qml_fn("outputAt"))),
               True)
+        # The snap target has to agree with outputAt. It had the right idea and
+        # the wrong divisor: the y range and the index both used the app row
+        # step, so the row a snap drag landed on depended on how tall the other
+        # column's rows happened to be. Both must be guarded together -- fixing
+        # only the index would leave the range still ending early.
+        check("snap hit-testing indexes by the output row step too",
+              bool(re.search(r"Math\.floor\(y\s*/\s*root\.outRowStep\)", qml_fn("snapOutputAt"))),
+              True)
+        check("snap hit-testing bounds the y range by the output row step",
+              "root.outputRows.length * root.outRowStep" in qml_fn("snapOutputAt"), True)
+        check("snap hit-testing never divides y by the app row step",
+              "root.rowStep" in qml_fn("snapOutputAt"), False)
         check("the output dot's y uses the output row step",
               "root.outRowStep" in qml_fn("dotCenterFor"), True)
         check("scrolling the cursor uses the step of the column it is in",
@@ -2573,6 +2667,81 @@ Client #13
               isinstance(payload.get("sinkAliases"), dict), True)
     finally:
         run, load_rules, resolve_sink_labels = real_run, real_rules, real_labels
+
+    # The watcher's death classification, in BarWidget.qml. The logic is QML, so
+    # it cannot be exercised here the way the Python above is; these are source
+    # guards on the exact statements that were wrong, and they exist because a
+    # hardcoded 0 on the stderr path was invisible to every other check in this
+    # suite while turning every SIGKILL into a "tidy shutdown".
+    try:
+        with open(os.path.normpath(os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), os.pardir, "BarWidget.qml")),
+                encoding="utf-8") as f:
+            bar_src = qml_strip_comments(f.read())
+
+        def bar_block(anchor):
+            """The source text of the brace-balanced block opening at `anchor`."""
+            start = bar_src.find(anchor)
+            if start < 0:
+                return ""
+            depth, i = 0, bar_src.find("{", start)
+            while i < len(bar_src):
+                if bar_src[i] == "{":
+                    depth += 1
+                elif bar_src[i] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return bar_src[start:i + 1]
+                i += 1
+            return ""
+
+        def bar_fn(name):
+            """The source text of one BarWidget.qml function, braces balanced."""
+            return bar_block("  function %s(" % name)
+
+        # The channel that fires first must not claim a code. It has none: 0 here
+        # read as "clean exit" for every death the helper did not mark.
+        _stderr = bar_block("stderr: StdioCollector {")
+        check("the stderr exit path passes no code, not zero",
+              re.search(r"_processExit\([^)]*,\s*(null|undefined)\s*\)", _stderr) is not None, True)
+        check("the stderr exit path never hardcodes 0 as a code",
+              re.search(r"_processExit\([^)]*,\s*0\s*\)", _stderr) is None, True)
+        # The second channel is the only one that carries a code, and it must
+        # actually pass it through rather than folding it into the reason.
+        _onExited = bar_block("onExited: function(exitCode)")
+        check("onExited forwards the real exit code",
+              re.search(r"_processExit\(\s*\"\"\s*,\s*exitCode\s*\)", _onExited) is not None, True)
+        # An unmarked death is unexplained, and unexplained is a crash: the
+        # fall-through of the action table, reached by a null code as well as by
+        # any signal. Only a real 0 from onExited is a clean self-exit.
+        _action = bar_fn("_exitAction")
+        check("a null code falls through to a crash, not to a stop",
+              re.search(r"return\s+[\"']crash[\"']\s*\n\s*\}", _action) is not None, True)
+        check("only an explicit 0 counts as a clean exit",
+              re.search(r"code\s*===\s*0[\s\S]{0,80}?return\s+[\"']stop[\"']", _action) is not None,
+              True)
+        check("the action table still knows the three intentional exits",
+              all(tok in _action for tok in ('"flock"', '"stop"', '"crash"'))
+              and "code === 3" in _action and "code === 15" in _action
+              and "code === 0" in _action, True)
+        # The de-dup must compare decisions, so a second channel carrying the
+        # real signal number still reaches _crash instead of being dropped.
+        _exit = bar_fn("_processExit")
+        check("the de-dup window suppresses only an identical action",
+              re.search(r"action\s*===\s*root\._lastExitAction", _exit) is not None, True)
+        check("the de-dup window still records what it decided",
+              "root._lastExitAction = action" in _exit, True)
+        # A crash supersedes a stop already decided for the same death, so the
+        # 30s re-arm must not stay pending behind the 3s retry.
+        check("a crash cancels the pending 30s re-arm",
+              re.search(r"watchRearm\.stop\(\)[\s\S]*?_crash\(", _exit) is not None, True)
+        # The crash budget is the point of classifying correctly at all: a
+        # SIGKILL that takes the stop branch never increments it.
+        check("a crash is the path that spends the restart budget",
+              re.search(r"if \(action === \"stop\"\)[\s\S]*?return[\s\S]*?_crash\(", _exit) is not None,
+              True)
+    finally:
+        pass
 
     failed = [name for name, ok in checks if not ok]
     print(f"selftest: {len(checks) - len(failed)}/{len(checks)} passed")

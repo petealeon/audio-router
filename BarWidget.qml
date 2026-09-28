@@ -7,7 +7,7 @@ import qs.Ui
 BarWidget {
   id: root
   moduleName: "petealeon.router"
-  property string version: "1.4.1"
+  property string version: "1.4.2"
 
   // Watcher health, surfaced to Panel.qml through the injected hostWidget
   // reference. A crashed watcher loses rule re-assertion silently, so the
@@ -28,6 +28,9 @@ BarWidget {
   property bool _stopping: false
   property int _flockRetries: 0
   property int _lastExit: 0
+  // What the last exit was decided to be, so the second channel for the same
+  // death can tell "already handled" from "new evidence".
+  property string _lastExitAction: ""
   // Set when the user moves the switch. The persisted state is read a few
   // milliseconds after load, and must not overwrite a toggle that happened in
   // the meantime (panel opened and switched immediately) — nor be cancelled
@@ -203,7 +206,16 @@ BarWidget {
         var msg = String(text || "").trim()
         if (msg !== "") root.logEvent("watcher: " + msg)
         var m = /__WATCH_EXIT\s+(\w+)/.exec(msg)
-        root._processExit(m ? m[1] : "", 0)
+        // The code is deliberately null, not 0. This channel is dispatched
+        // before onExited, so whatever we pass here is the first classification
+        // of the death -- and a hardcoded 0 read as "clean exit" for every death
+        // the helper did not mark, which is all of them except the flock and
+        // parent-gone cases. A SIGKILL or an OOM kill then took the
+        // intentional-stop branch below: a 30s re-arm instead of the 3s retry,
+        // and no charge against the 5-restart budget, so a crash loop looked
+        // like a user switching routing off. null says "reason only, the real
+        // code is still coming" and lets the onExited below upgrade it.
+        root._processExit(m ? m[1] : "", null)
       }
     }
 
@@ -313,13 +325,32 @@ BarWidget {
     onTriggered: root.beginRestore()
   }
 
+  // Which of the three responses a death gets. Kept separate from the dispatch
+  // below so the de-dup there can compare decisions instead of guessing from
+  // timing.
+  //
+  // A null code means "the stderr channel, which knows only the reason" and is
+  // deliberately not treated as a clean exit: the helper marks every exit it
+  // intends, so a marker-less death is unexplained, and unexplained is a crash.
+  // Reading null as 0 was what let a SIGKILL through as a tidy shutdown.
+  function _exitAction(reason, code) {
+    if (reason === "flock" || code === 3) return "flock"
+    if (reason === "parent" || code === 15 || code === 0) return "stop"
+    return "crash"
+  }
+
   // Single dispatch point for watcher death. Two channels feed it — the helper
   // prints a __WATCH_EXIT marker on stderr (collected via onStreamFinished,
   // reliably delivered even when quickshell drops onExited for a clean
   // non-zero exit), and onExited carries the numeric code for signal deaths
-  // (SIGKILL 9, SIGTERM 15). For a given death either or both may arrive; the
-  // 200ms de-dup window covers the double-firing case since consecutive
-  // watcher exits are always seconds apart.
+  // (SIGKILL 9, SIGTERM 15). The stderr channel arrives FIRST and knows only
+  // the reason, so it passes a null code; onExited then supplies the number.
+  //
+  // The two can both arrive for one death, so the second must not re-run the
+  // timers, but it must not be dropped either: dropping it is what let a
+  // SIGKILL reach the intentional-stop branch and never touch the restart
+  // budget. So the window suppresses a duplicate only while it carries no new
+  // information, and otherwise folds the real code into the first decision.
   function _processExit(reason, code) {
     if (!root.watchEnabled) {
       // Routing was just switched off and the watcher is now gone, so it can no
@@ -332,13 +363,22 @@ BarWidget {
       root._stopping = false
       return
     }
+    if (code === undefined) code = null
+    var action = root._exitAction(reason, code)
     var now = Date.now()
-    if (now - root._lastExit < 200) return
+    if (now - root._lastExit < 200) {
+      // Second channel for a death already acted on. Suppressing the duplicate
+      // is the point of the window; suppressing the *upgrade* is the bug it
+      // caused. stderr is dispatched first and reports no code, so onExited's
+      // number is the only evidence that an unexplained death was a signal.
+      if (action === root._lastExitAction) return
+    }
     root._lastExit = now
+    root._lastExitAction = action
     var wasAlive = root.watchAlive
     root.watchAlive = false
     if (root.watchDead) return
-    if (reason === "flock" || code === 3) {
+    if (action === "flock") {
       // Flock conflict (or the parent-gone variant, also exit 3) — retried
       // once per episode, since the orphaned holder of a reloaded shell clears
       // within its own next poll; the slow re-arm then takes over.
@@ -353,13 +393,16 @@ BarWidget {
       }
       return
     }
-    if (reason === "parent" || code === 15 || code === 0) {
+    if (action === "stop") {
       if (wasAlive) return // late SIGTERM from a stop whose respawn already started
-      root.logEvent("watcher stopped (code " + code + "); will re-arm if still needed")
+      root.logEvent("watcher stopped (code " + (code === null ? reason || "none" : code) + "); will re-arm if still needed")
       watchRearm.restart()
       return
     }
-    root._crash(code || 9)
+    // A crash supersedes a stop already decided for this death: do not leave a
+    // 30s re-arm pending when the 3s retry is the right response.
+    watchRearm.stop()
+    root._crash(code === null ? 9 : code)
   }
 
   function _crash(code) {

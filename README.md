@@ -37,12 +37,6 @@ unregisters the old plugin (which also removes its bar entry) and re-adds the
 widget under `petealeon.router` in the same right-hand section. Your routing
 rules in `~/.config/omarchy/router-rules.json` are never touched by the rename.
 
-## Marketplace
-
-Not listed yet. Submission details, including the manifest fields the listing
-uses, are in `docs/marketplace-submission.md`. The repository at the point of a
-tagged release (`vX.Y.Z`) is always the source of truth for what a version does.
-
 ## Uninstall
 
 ```sh

@@ -3,6 +3,79 @@
 All notable changes to `petealeon.router` are documented here. SemVer; releases are
 tagged `vX.Y.Z`.
 
+## [1.4.1] - 2026-09-28
+
+One application could be listed twice, and one could be listed not at all.
+
+### Fixed
+- **A PipeWire ALSA app could be listed twice.** PipeWire names the ALSA client
+  of an application `PipeWire ALSA [app]`, and reports the resulting stream with
+  no `application.process.binary` at all. The panel therefore keyed the row by
+  the node name, `alsa_playback.cliamp`, while the client and any pin on it were
+  keyed by the binary, `cliamp`: two different keys, one label, two rows. Rows
+  are now folded by identity rather than by key, so one app is one row however
+  the audio server happens to name its parts, and a pin's identity is carried
+  through the fold instead of being lost. Verified against the live session that
+  reported it, and against a real application split the same way, which must
+  also come out as one row.
+
+- **A real application could be hidden as audio-stack plumbing.** Fixing the row
+  above, `PipeWire ALSA [x]` was treated as a name owned by the audio stack and
+  excluded by its first word. It is not: `x` is the application. On the machine
+  that reported the duplicate, `x` was `cliamp` 2.0.1, an installed terminal
+  music player, and it vanished from the panel entirely — an application you had
+  installed and were using, gone, with nothing on screen to say why. Stack names
+  are now excluded by exact, tag-stripped name only — `pipewire`, the
+  session manager, the portals, `quickshell`, `systemd`, `EasyEffects` and this
+  plugin's own tooling — with no first-word or namespace rule to over-match.
+  The panel's row for such an app also reads as the application now — `cliamp`,
+  not `PipeWire ALSA [cliamp]`.
+
+- **`remove <name>` could miss a rule.** A rule written as
+  `PipeWire ALSA [cliamp]` is listed and displayed as `cliamp`, and removing by
+  the displayed name left it in place while reporting success. Matching is now
+  by identity set, so either spelling finds it.
+
+### Changed
+- **The circle sits next to its source's name.** It used to sit at the far right
+  of the source column, so a short name like `cliamp` had its circle marooned
+  across 140px of empty row, reading as decoration rather than as that app's
+  state. The circle now follows the end of the name, and the ring you click to
+  unlink comes with it. That gives the label back the right-hand gutter the
+  circle used to reserve.
+
+- **Output names no longer need an ellipsis.** An output's name carries its
+  identity at the *end* — `RODE NT-USB Analog Stereo` says the port is analog
+  stereo — and an ellipsis eats exactly that. Output labels now wrap to two
+  lines in a wider column, sized so the longest name this plugin has seen
+  (`ThinkPad Dock USB Audio Analog Stereo`) fits whole. The source column pays
+  for the extra width and keeps roughly the same label width as before, which is
+  the right trade: long source names are uncommon, and when they happen the
+  start of the name is the part that identifies them.
+
+- **A connected output no longer grows a second dot.** Wrapping the output names
+  put the output's own dot out of step with the line that terminates on it, and a
+  connected output drew two: the dot belonging to the name, and a second one
+  where the line actually landed. The dot now sits on the name's first line, the
+  way a leading icon reads against wrapped text rather than floating in the gap
+  between the two, and the line and the dot read the same position from the row
+  that draws them — so the two cannot come apart again, whatever the name or the
+  font scale.
+
+- One exclusion list, in one place. `Model.js` owns the rule and the helper's
+  selftest runs the same cases against both implementations, so a name edited
+  in one and not the other fails the suite — the drift that let this through.
+  The shared table is data, and it records *why* each name is or is not the
+  audio stack, so the same mistake cannot be re-derived from a plausible-looking
+  example again.
+- An app answers to the name inside a PipeWire wrapper as well as the wrapper,
+  when deciding what is the same app. Today every record for an ALSA app reports
+  the identical wrapper string and they fold on that; a PipeWire version
+  reporting the bare name on one side and the wrapper on the other would
+  otherwise split the app across two rows again.
+- A pinned row is keyed by its pin, so its identity no longer follows whatever
+  node name the stream happened to have.
+
 ## [1.4.0] - 2026-09-27
 
 A correctness and hardening release. Three bugs could affect audio a user did

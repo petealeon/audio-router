@@ -7,7 +7,7 @@ import qs.Ui
 BarWidget {
   id: root
   moduleName: "petealeon.router"
-  property string version: "1.4.0"
+  property string version: "1.4.1"
 
   // Watcher health, surfaced to Panel.qml through the injected hostWidget
   // reference. A crashed watcher loses rule re-assertion silently, so the

@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "petealeon.router",
   "name": "Audio Router",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "author": "petealeon",
   "description": "Persistent per-app audio routing: link any app to any output from a dedicated two-column patchbay widget",
   "license": "MIT",

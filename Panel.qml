@@ -206,19 +206,127 @@ Panel {
   readonly property int minLabelW: Style.space(80)
   readonly property int appDotX: Style.space(12)
   readonly property int outDotX: Style.space(48)
-  readonly property int appGutter: Style.space(48)
   readonly property int connectorLever: Style.space(30)
+  // The source circle sits immediately after its name rather than at the far
+  // right of the column, so the label needs no right-hand gutter reserved for
+  // it. That reclaimed width is what pays for the wider output column below.
+  // The circle is 6px with a 13px ring around it, so a dot at the very end of
+  // the name still needs ring/2 plus a pad clear of the column edge.
+  readonly property int dotGap: Style.space(8)
+  readonly property int dotRightPad: Style.space(6)
+  readonly property real dotRingR: 6.5
+  // Widest a source label may grow before it ellipsizes: the app column less the
+  // fixed left inset, the gap, the ring's right half and the edge pad. About 19
+  // characters at the default monospace 12px.
+  readonly property int appLabelMaxW: Math.max(
+    root.minLabelW,
+    appCol.width - (root.appDotX + root.speakerGutter) - root.dotGap - root.dotRingR - root.dotRightPad
+  )
+  // Output labels wrap to two lines instead of ellipsizing, because the tail of
+  // an output name carries the part that matters ("Analog Stereo" says what the
+  // port is) and an ellipsis eats exactly that. 210px of column leaves ~20
+  // characters a line, so 40 in all: the longest name seen on this machine,
+  // "ThinkPad Dock USB Audio Analog Stereo", fits without truncation.
+  readonly property int outColW: Style.space(210)
+  readonly property int outRowH: Style.space(32)
+  readonly property int outRowStep: root.outRowH + root.rowGap
   // Gutter reserved left of every source label for the "is outputting" speaker
   // glyph. Reserved on every row (not only the ones with a stream) so the
   // labels stay in a single aligned column.
   readonly property int speakerGutter: Style.space(18)
 
-  readonly property var systemBinaries: {
-    var s = {}
-    var list = ["pipewire", "wireplumber", "pactl", "python3", "pw-dump", "xdg-desktop-portal", "xdg-desktop-portal-hyprland", "quickshell", "easyeffects", "systemd"]
-    for (var i = 0; i < list.length; ++i) s[list[i]] = 1
-    return s
+  // Where each row put its circle, published by the delegate that draws it. The
+  // patch lines, the ring's click target and the drag ghost all read it back
+  // instead of recomputing the position, so they cannot disagree with the dot
+  // they are meant to touch. Mutated in place, which is fine: every reader is an
+  // event handler (paint, press, drag), not a binding.
+  property var _dotX: ({})
+
+  function noteDotX(key, x) {
+    if (key === "") return
+    root._dotX[key] = x
   }
+
+  function clearDotX(key) {
+    delete root._dotX[key]
+  }
+
+  // The vertical counterpart of _dotX, for the output column. Same contract: the
+  // delegate that draws the dot publishes its centre, and everything that has to
+  // land on that dot reads it back. The agreement is not cosmetic here, it is
+  // load-bearing: the patch canvas draws its line endpoint behind the columns
+  // (canvas z:1, columns z:2), so when the passive dot and the endpoint dot
+  // coincide the passive one hides the endpoint and the row shows a single dot.
+  // Let them drift apart and a connected output grows a second dot in the gap
+  // between them, which is exactly what a half-correct anchor produces.
+  //
+  // Unlike _dotX this repaints the canvas on every write. The map is mutated in
+  // place, so the Canvas's dependency on root._outDotY never fires on its own;
+  // a label that re-wraps (theme or font-scale change, an output coming back
+  // online) would otherwise leave the line pointing at the old position.
+  property var _outDotY: ({})
+
+  property bool _repaintQueued: false
+
+  // Repaint the patch canvas, guarding the one case where it cannot be done
+  // yet. linkCanvas is declared after the columns, so it does not exist while the
+  // first row's delegate is reporting in, and an unguarded requestPaint() there
+  // throws a TypeError once per row. Coalescing matters for the same reason: a
+  // dozen rows reporting in the same frame want one repaint between them, not a
+  // dozen, and callLater lands after the layout pass so a label that has just
+  // re-wrapped is repainted at its new position rather than its old one.
+  function repaintPatch() {
+    if (!root.linkCanvas) return
+    if (root._repaintQueued) return
+    root._repaintQueued = true
+    Qt.callLater(function() {
+      root._repaintQueued = false
+      if (root.linkCanvas) root.linkCanvas.requestPaint()
+    })
+  }
+
+  function noteOutDotY(key, y) {
+    if (key === "") return
+    root._outDotY[key] = y
+    root.repaintPatch()
+  }
+
+  function clearOutDotY(key) {
+    delete root._outDotY[key]
+    root.repaintPatch()
+  }
+
+  // The y of an output row's dot centre, in that row's own coordinates. A row
+  // whose delegate has not reported yet falls back to the row centre, which is
+  // where the dot sat before labels could wrap onto a second line.
+  function outDotCenterY(row) {
+    if (!row) return root.outRowH * 0.5
+    var known = root._outDotY[row.key]
+    if (known !== undefined) return known
+    return root.outRowH * 0.5
+  }
+
+  // The x of a source row's circle centre: the end of its name, plus the gap.
+  // A row whose delegate has not reported yet falls back to the shortest
+  // possible name, which is the leftmost the dot can ever sit.
+  function appDotXFor(row) {
+    if (!row) return root.appDotX
+    var known = root._dotX[row.key]
+    if (known !== undefined) return known
+    return root.appDotXForWidth(0)
+  }
+
+  function appDotXForWidth(advanceWidth) {
+    return root.appDotX + root.speakerGutter
+      + Math.min(advanceWidth, root.appLabelMaxW)
+      + root.dotGap
+  }
+
+  // The audio stack and our own tooling are not routable. The list and the
+  // predicate live in Model.js and there only: this property used to hold a
+  // second copy of the names, and the two drifted without the selftest noticing
+  // because it compared the name lists and not the rule applied to a name.
+  // See Model.isExcludedClient.
 
   readonly property bool busy: root.dragging
 
@@ -232,8 +340,12 @@ Panel {
   property string hoverAppKey: ""
   property string hoverTarget: ""
 
-  // Keyboard cursor. appCol and outCol share a row grid (same rowStep, same
-  // y origin), so cursorRow is literally the same screen row in either column.
+  // Keyboard cursor. appCol and outCol each have their own row grid: the app
+  // rows are one line tall, the output rows two (their names wrap rather than
+  // ellipsize, because an output name's tail is the part that matters). Both
+  // grids start at the same y, and cursorRow is an index into whichever one the
+  // cursor is currently in -- so the two are not the same screen row, and
+  // anything that maps a row to a y has to ask which column it is in.
   // "header" is a virtual section above row 0 holding the routing switch.
   // The cursor is keyed rather than purely indexed because rows come and go
   // under it: buildRows() re-sorts appRows whenever a stream appears, stops
@@ -303,10 +415,8 @@ Panel {
   }
 
   function clientKey(c) {
-    var cb = String(c.binary || "").toLowerCase()
-    if (root.systemBinaries[cb]) return ""
-    var cleaned = Model.stripInput(c.appName)
-    return Model.appKey({ binary: c.binary, appName: cleaned })
+    if (Model.isExcludedClient(c)) return ""
+    return Model.appKey({ binary: c.binary, appName: Model.stripInput(c.appName) })
   }
 
   function applyState(raw) {
@@ -387,6 +497,13 @@ Panel {
     var i
     for (i = 0; i < root.rules.length; ++i) {
       var r = root.rules[i]
+      // A pin left over from before the audio stack was excluded still names an
+      // internal node. It cannot be honoured -- the helper will not steer that
+      // node -- so rendering it would show a row the user can neither trust nor
+      // reason about, and its sink would keep a ghost output row alive for a
+      // routing that will never happen. Dropped here as well as in the helper's
+      // list payload, so neither side depends on the other being current.
+      if (Model.isExcludedClient({ appName: r.app, binary: r.binary })) continue
       var rk = Model.ruleKey(r)
       if (!seen[rk]) { seen[rk] = 1; out.push(r) }
     }
@@ -420,7 +537,10 @@ Panel {
       var w = root.pendingWrites[i]
       var wk = Model.ruleKey(w)
       var disk = null
-      for (j = 0; j < root.rules.length; ++j) if (Model.ruleKey(root.rules[j]) === wk) disk = root.rules[j]
+      // Confirmed by identity overlap, not key equality. A false negative here
+      // does not look like a failure: the write is dropped as "not confirmed"
+      // and the user's pin silently reverts a second later.
+      for (j = 0; j < root.rules.length; ++j) if (Model.identitiesOverlap(root.rules[j], w)) disk = root.rules[j]
       var wantRemoval = (w.sink === "__default__" || w.sink === "")
       var confirmed = wantRemoval ? disk === null : (disk !== null && disk.sink === w.sink)
       if (confirmed || now - (w.ts || 0) > 1000) {
@@ -441,7 +561,26 @@ Panel {
     var rowsMap = {}
     var order = []
     var i
-    var keys = []
+
+    // Exact-key hit, else the first row whose identity set overlaps. A rule or a
+    // client that names an app with a different field than the stream used (a
+    // stream reported without application.process.binary keys on its node.name,
+    // the rule for the same app keys on the binary) must land on the same row:
+    // that mismatch is what drew one app as two rows, with the panel insisting
+    // the second half was unrouted while the watcher moved it as one.
+    function findRow(entry) {
+      var exact = rowsMap[Model.appKey(entry)]
+      if (exact) return exact
+      for (var n = 0; n < order.length; ++n) {
+        if (Model.identitiesOverlap(order[n], entry)) return order[n]
+      }
+      return null
+    }
+    function addRow(row) {
+      rowsMap[row.key] = row
+      order.push(row)
+      return row
+    }
 
     for (i = 0; i < root.sinkInputs.length; ++i) {
       var e = root.sinkInputs[i]
@@ -449,8 +588,7 @@ Panel {
       var row = rowsMap[key]
       if (!row) {
         row = { key: key, label: Model.friendlyLabel(e), binary: e.binary || "", appName: e.appName || "", nodeName: e.nodeName || "", streams: [], rule: null, isPending: false, idle: false }
-        rowsMap[key] = row
-        order.push(row)
+        addRow(row)
       }
       row.streams.push({ id: e.id, sink: e.sink, sinkName: e.sinkName || "", nodeName: e.nodeName || "" })
     }
@@ -459,19 +597,19 @@ Panel {
     for (i = 0; i < effective.length; ++i) {
       var r = effective[i]
       var k = Model.ruleKey(r)
-      if (rowsMap[k]) {
-        if (!rowsMap[k].rule) rowsMap[k].rule = r
+      var target = findRow(r)
+      if (target) {
+        if (!target.rule) target.rule = r
       } else {
-        var idleRow = { key: k, label: r.app || r.binary || k, binary: r.binary || "", appName: r.app || "", nodeName: r.node || "", streams: [], rule: r, isPending: false, idle: true }
-        rowsMap[k] = idleRow
-        order.push(idleRow)
+        var idleRow = { key: k, label: Model.friendlyLabel({ appName: r.app, binary: r.binary, nodeName: r.node }), binary: r.binary || "", appName: r.app || "", nodeName: r.node || "", streams: [], rule: r, isPending: false, idle: true }
+        addRow(idleRow)
       }
     }
 
     for (i = 0; i < root.pendingWrites.length; ++i) {
       var pw = root.pendingWrites[i]
       if (!pw.sink || pw.sink === "__default__") {
-        var pwRow = rowsMap[Model.ruleKey(pw)]
+        var pwRow = findRow(pw)
         if (pwRow) pwRow.pendingDefault = true
       }
     }
@@ -480,24 +618,31 @@ Panel {
       var c = root.clients[i]
       var ck = root.clientKey(c)
       if (!ck) continue
-      if (rowsMap[ck]) {
-        if (rowsMap[ck].runIdle) {
-          var cleaned2 = Model.stripInput(c.appName)
-          if (/^[A-Z]/.test(cleaned2) && !/^[A-Z]/.test(rowsMap[ck].label)) {
-            rowsMap[ck].label = cleaned2
-            rowsMap[ck].appName = cleaned2
+      var crow = findRow(c)
+      if (crow) {
+        if (crow.runIdle) {
+          // friendlyLabel, not stripInput: an ALSA application reports a
+          // "PipeWire ALSA [app]" name here, and stripInput would put that
+          // wrapper back on the row this is meant to improve.
+          var cleaned2 = Model.friendlyLabel(c)
+          if (/^[A-Z]/.test(cleaned2) && !/^[A-Z]/.test(crow.label)) {
+            crow.label = cleaned2
+            crow.appName = cleaned2
           }
         }
         continue
       }
       root._clientCount = root._clientCount || {}
       if ((root._clientCount[ck] || 0) < 3) continue
-      var cb = String(c.binary || "").toLowerCase()
       var cleaned = Model.stripInput(c.appName)
-      var runRow = { key: ck, label: cleaned || cb || ck, binary: c.binary || "", appName: cleaned || "", nodeName: "", streams: [], rule: null, isPending: false, idle: true, runIdle: true }
-      rowsMap[ck] = runRow
-      order.push(runRow)
+      var runRow = { key: ck, label: Model.friendlyLabel(c), binary: c.binary || "", appName: cleaned || "", nodeName: "", streams: [], rule: null, isPending: false, idle: true, runIdle: true }
+      addRow(runRow)
     }
+
+    // Fold anything that still names one app twice. Two streams of the same app
+    // can differ in fields, so neither the rule nor the client loop above is
+    // guaranteed to have joined them.
+    order = Model.mergeRows(order)
 
     order.sort(function(a, b) {
       var la = String(a.label || "").toLowerCase()
@@ -505,10 +650,13 @@ Panel {
       return la < lb ? -1 : la > lb ? 1 : 0
     })
 
+    // ids is in the signature because the fold is part of the row model: two
+    // rows becoming one changes what is drawn, and a signature without it would
+    // let the panel keep rendering the split.
     var appSig = JSON.stringify(order.map(function(r) {
       var sinks = []
       for (var si = 0; si < r.streams.length; ++si) sinks.push(r.streams[si].sinkName || "")
-      return [r.key, r.rule ? r.rule.sink : "", r.isPending ? 1 : 0, r.pendingDefault ? 1 : 0, r.idle ? 1 : 0, r.runIdle ? 1 : 0, r.label, sinks.sort().join(",")]
+      return [r.key, r.ids || [], r.rule ? r.rule.sink : "", r.isPending ? 1 : 0, r.pendingDefault ? 1 : 0, r.idle ? 1 : 0, r.runIdle ? 1 : 0, r.label, sinks.sort().join(",")]
     }))
     if (appSig !== root._appRowsSig) {
       root._appRowsSig = appSig
@@ -771,8 +919,12 @@ Panel {
     if (!routerScroll) return
     var maxY = Math.max(0, routerScroll.contentHeight - routerScroll.height)
     if (maxY <= 0) return
-    var top = root.cursorRow * root.rowStep
-    var bottom = top + root.rowH
+    // The two columns have their own row steps, so the row the cursor is on is
+    // only as tall as the column it currently sits in.
+    var step = root.cursorSection === "outputs" ? root.outRowStep : root.rowStep
+    var rowH = root.cursorSection === "outputs" ? root.outRowH : root.rowH
+    var top = root.cursorRow * step
+    var bottom = top + rowH
     var margin = Style.space(6)
     if (root.cursorSection === "header" || top < routerScroll.contentY + margin) {
       routerScroll.contentY = Math.max(0, Math.min(maxY, top - margin))
@@ -859,7 +1011,7 @@ Panel {
   function badgeHit(x, y, row) {
     var inRow = y - Math.floor(y / root.rowStep) * root.rowStep
     if (inRow < 0 || inRow >= root.rowH) return false
-    var cx = appCol.width - root.appGutter
+    var cx = root.appDotXFor(row)
     var half = Style.space(9)
     return x >= cx - half && x <= cx + half
   }
@@ -876,8 +1028,8 @@ Panel {
   function outputAt(x, y) {
     if (outputRepeater.count === 0) return null
     if (x < outCol.x || x > outCol.x + outCol.width) return null
-    if (y < 0 || y >= root.outputRows.length * root.rowStep) return null
-    var idx = Math.floor(y / root.rowStep)
+    if (y < 0 || y >= root.outputRows.length * root.outRowStep) return null
+    var idx = Math.floor(y / root.outRowStep)
     if (idx >= root.outputRows.length) return null
     var key = root.outputRows[idx].key
     if (key === "__default__") return null
@@ -895,7 +1047,7 @@ Panel {
     var storeOnly = !root.routingOn && sinkArg !== "__default__"
     root.logEvent("link " + (storeOnly ? "store-only " : "") + "key=" + key + " app=" + (row.appName || "") + " bin=" + (row.binary || "") + " target=" + (sinkArg === "__default__" ? "_default_" : sinkArg))
     root.pendingWrites = root.pendingWrites.filter(function(w) {
-      return Model.ruleKey(w) !== key
+      return !Model.identitiesOverlap(row, w)
     })
     if (sinkArg !== "__default__") {
       root.pendingWrites.push({
@@ -917,7 +1069,7 @@ Panel {
     if (!row) return
     root.logEvent("unpin key=" + key + " app=" + (row.appName || "") + " bin=" + (row.binary || ""))
     root.pendingWrites = root.pendingWrites.filter(function(w) {
-      return Model.ruleKey(w) !== key
+      return !Model.identitiesOverlap(row, w)
     })
     root.pendingWrites.push({
       app: row.appName || "",
@@ -957,11 +1109,14 @@ Panel {
     if (side === "app") {
       var ai = root.rowIndexForKey(id)
       if (ai < 0) return null
-      return { x: appCol.width - root.appGutter, y: ai * root.rowStep + root.rowH * 0.5 }
+      return { x: root.appDotXFor(root.appRows[ai]), y: ai * root.rowStep + root.rowH * 0.5 }
     }
     var oi = root.outputIndexFor(id)
     if (oi < 0) return null
-    return { x: outCol.x + root.outDotX, y: oi * root.rowStep + root.rowH * 0.5 }
+    return {
+      x: outCol.x + root.outDotX,
+      y: oi * root.outRowStep + root.outDotCenterY(root.outputRows[oi])
+    }
   }
 
   function rebuildPatch() {
@@ -1181,7 +1336,7 @@ Panel {
       Item {
         id: patchArea
         width: parent.width
-        height: Math.max(root.appRows.length, root.outputRows.length) * root.rowStep
+        height: Math.max(root.appRows.length * root.rowStep, root.outputRows.length * root.outRowStep)
         // While routing is off, drag/drop still works (edits are kept and
         // applied when the switch comes back on), but the whole patch is dimmed
         // so nothing reads as actively routed. The statusNote above carries the
@@ -1200,12 +1355,14 @@ Panel {
             id: appRepeater
             model: root.appRows
             delegate: Component {
-              Item {
-                id: appDlg
-                required property var model
-                readonly property string dkey: model.key
-                width: appCol.width
-                height: root.rowStep
+                Item {
+                  id: appDlg
+                  required property var model
+                  readonly property string dkey: model.key
+                  width: appCol.width
+                  height: root.rowStep
+                  Component.onCompleted: root.noteDotX(appDlg.dkey, root.appDotXForWidth(appMetrics.advanceWidth))
+                  Component.onDestruction: root.clearDotX(appDlg.dkey)
 
                 Rectangle {
                   anchors.fill: parent
@@ -1234,11 +1391,21 @@ Panel {
                     text: "\uF028"
                   }
 
+                  // Not an Item, so it draws nothing and takes no `visible`.
+                  // Declares exactly what appLabel declares -- pixelSize, and
+                  // deliberately no family, so both resolve the same default
+                  // font and the measured width is the width actually drawn.
+                  TextMetrics {
+                    id: appMetrics
+                    font.pixelSize: Style.font.body
+                    text: model.label
+                  }
+
                   Text {
                     id: appLabel
                     x: root.appDotX + root.speakerGutter
                     anchors.verticalCenter: parent.verticalCenter
-                    width: Math.max(root.minLabelW, appCol.width - root.appDotX - root.appGutter - Style.space(16) - (model.streams.length > 1 ? Style.space(18) : 0))
+                    width: root.appLabelMaxW - (model.streams.length > 1 ? Style.space(18) : 0)
                     elide: Text.ElideRight
                     font.pixelSize: Style.font.body
                     color: root.textColor
@@ -1262,8 +1429,11 @@ Panel {
                     width: 6
                     height: 6
                     radius: 3
-                    x: appLine.width - root.appGutter - 3
+                    // Sits just past the end of the name, so a short app keeps
+                    // its circle close instead of stranded at the column edge.
+                    x: root.appDotXForWidth(appMetrics.advanceWidth)
                     anchors.verticalCenter: parent.verticalCenter
+                    onXChanged: root.noteDotX(appDlg.dkey, x)
                     color: (model.rule || model.pendingDefault) ? root.userRouteColor : root.textColor
                     opacity: model.streams.length === 0 ? 0.25 : 0.6
 
@@ -1294,7 +1464,7 @@ Panel {
           id: outCol
           x: parent.width - width
           y: 0
-          width: Style.space(178)
+          width: root.outColW
           spacing: 0
           z: 2
 
@@ -1307,7 +1477,12 @@ Panel {
                 required property var model
                 readonly property string okey: model.key
                 width: outCol.width
-                height: root.rowStep
+                height: root.outRowStep
+                // onYChanged below already fires on the first binding
+                // evaluation; these make the contract explicit and cover the
+                // destruction case, which a y change never does.
+                Component.onCompleted: root.noteOutDotY(outDlg.okey, outDot.y + 3)
+                Component.onDestruction: root.clearOutDotY(outDlg.okey)
 
                 Rectangle {
                   anchors.fill: parent
@@ -1320,12 +1495,21 @@ Panel {
                 Item {
                   anchors.top: parent.top
                   width: parent.width
-                  height: root.rowH
+                  height: root.outRowH
 
                   Text {
+                    id: outLabel
                     x: root.outDotX + Style.space(10)
                     anchors.verticalCenter: parent.verticalCenter
                     width: outCol.width - (x + Style.space(6)) - (model.offline ? Style.space(34) : 0)
+                    // Wrap rather than elide: the tail of an output name is the
+                    // informative part, and an ellipsis would replace exactly
+                    // that. Two lines of ~20 characters cover every name seen
+                    // here. maximumLineCount stays as a floor under the row
+                    // height -- a pathological name degrades to an ellipsis
+                    // instead of spilling out of its row.
+                    wrapMode: Text.WordWrap
+                    maximumLineCount: 2
                     elide: Text.ElideRight
                     font.pixelSize: Style.font.body
                     color: root.textColor
@@ -1349,8 +1533,25 @@ Panel {
                     width: 6
                     height: 6
                     radius: 3
-                    y: root.rowH / 2 - 3
+                    // The first line of the label, not the middle of the block.
+                    // A wrapped name reads as line 1 plus line 2, and a leading
+                    // icon belongs to line 1; centred on the block it would sit
+                    // in the gap between the two lines, belonging to neither.
+                    //
+                    // outLabel is vertically centred in outRowH, so for a
+                    // one-line name this lands exactly on the row centre -- the
+                    // position the dot had before labels could wrap -- and for a
+                    // two-line name it lands half a line box up, on line 1.
+                    //
+                    // 0.6 is half of a single-spaced line box (1.2em). Do not
+                    // reach for outLabel.lineHeight here: under the default
+                    // ProportionalHeight mode it is a multiplier, not pixels, and
+                    // it would silently collapse this offset to half a pixel.
+                    y: outLabel.y + outLabel.font.pixelSize * 0.6 - 3
                     x: root.outDotX - 3
+                    // Publish the centre, not the left/top edge, so the reader
+                    // gets the same point the patch line's endpoint is drawn at.
+                    onYChanged: root.noteOutDotY(outDlg.okey, y + 3)
                     color: root.accent
                     opacity: 0.7
                   }
@@ -1380,8 +1581,8 @@ Panel {
               })
             }
             if (root.dragging && root.dragRowIndex >= 0) {
-              var gx1 = appCol.width - root.appGutter
               var gy1 = root.dragRowIndex * root.rowStep + root.rowH * 0.5
+              var gx1 = root.appDotXFor(root.appRows[root.dragRowIndex])
               if (root.ghostFrom) {
                 gx1 = root.ghostFrom.x
                 gy1 = root.ghostFrom.y

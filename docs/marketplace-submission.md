@@ -18,7 +18,7 @@ listed, and the README says so explicitly.
 - [x] Install/removal is safe: `install.sh` gains `--remove`/`--purge`
 - [x] No symlinks in the repository; no secrets; ID not in the `omarchy.*` namespace
 - [x] README documents the data the plugin writes, where, and how to remove it
-- [ ] The commit being submitted is tagged (`v1.4.0`) and pushed — **do this
+- [ ] The commit being submitted is tagged (`v1.4.1`) and pushed — **do this
       last**, after the checklist above passes on that exact tree
 
 ## Suggested listing
@@ -34,7 +34,7 @@ Paste it into the [submit form](https://plugins.omarchy.org/publish).
 
 **Author:** petealeon
 
-**Version:** 1.4.0
+**Version:** 1.4.1
 
 **Description (short):**
 `Persistent per-app audio routing: link any app to any output from a
@@ -56,7 +56,7 @@ access. `bluetoothctl` is optional and used only to resolve a MAC to a name.
   "schemaVersion": 1,
   "id": "petealeon.router",
   "name": "Audio Router",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "author": "petealeon",
   "description": "Persistent per-app audio routing: link any app to any output from a dedicated two-column patchbay widget",
   "license": "MIT",

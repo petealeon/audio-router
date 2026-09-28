@@ -7,7 +7,8 @@ made while an app is silent kicks in the moment that app starts playing — and
 survives reboots.
 
 - **Bar widget:** `petealeon.router` (BarWidget.qml + Panel.qml + Model.js)
-- **Watcher/helper:** `assets/omarchy-router` (pure-python, zero deps beyond `pactl`)
+- **Watcher/helper:** `assets/omarchy-router` (pure-python, no dependencies
+  beyond `pactl`; `bluetoothctl` optional — see *Requirements*)
 - **Rules store:** `~/.config/omarchy/router-rules.json`
 - **State:** `~/.config/omarchy/petealeon-router.json` (on/off preference and cached
   Bluetooth device names — see *Data and privacy*)
@@ -60,10 +61,15 @@ Click the link icon (right side of the bar) to open the patchbay.
 
 - **Route:** drag an app row onto an output column.
 - **Reset to default:** drag onto the current default output row or click the
-  ring on the app row.
+  ring beside the app's name.
 - **Live sources:** a speaker glyph on the left of a row means that source is
   playing right now (accent when it is pinned, plain when it is just on the
   system default).
+- **Where things are:** a source's circle sits directly after its name rather
+  than at a fixed spot down the column, so a short name keeps its circle next to
+  it. An output name is shown in full over two lines instead of being cut short —
+  the tail of `RODE NT-USB Analog Stereo` is the part that says what it is, and
+  an ellipsis is exactly where that would go.
 - **Routing on/off:** the header switch (like other Omarchy tools) turns routing
   on and off. Off moves every stream back to the system default output and stops
   re-asserting; saved rules are kept, so switching back on re-pins the same apps.
@@ -96,11 +102,14 @@ keypress.
 | `Tab`, `Shift+Tab` | Next / previous panel |
 | `Escape` | Close |
 
-The cursor spans both columns, mirroring the patch: rows are shared, so moving
-right lands on the output the app is currently on. Highlighting is the same one
-the mouse uses, and hovering the routing switch with the mouse focuses it too.
-The cursor is tracked by app and output key rather than by row number, so it
-survives the 1s refresh — including an app whose stream stops mid-navigation.
+The cursor spans both columns, so moving right lands on the output the app is
+currently on and left comes back to where it was. The columns are *not*
+row-aligned — an output name takes two lines where a source name takes one — so
+the cursor keeps a position per column rather than one shared row number.
+Highlighting is the same one the mouse uses, and hovering the routing switch with
+the mouse focuses it too. The cursor is tracked by app and output key rather than
+by row number, so it survives the 1s refresh — including an app whose stream stops
+mid-navigation.
 
 ## Rule matching
 
@@ -109,15 +118,51 @@ Rules are matched per stream in order of specificity:
 1. process-binary basename (e.g. `brave`, `mpv`)
 2. PipeWire `node.name` basename
 3. `application.name`, with a trailing `" input"` ignored
+4. the application named inside a `PipeWire ALSA [app]` wrapper
 
 Browser streams often carry a stable `node.name` but no reliably unique binary
-per process, so the node key keeps Brave/Signal rules matching. System services
+per process, so the node key keeps Brave/Signal rules matching. An app is the
+*set* of names its records answer to, and two records are the same app when those
+sets intersect at all — which is what makes the fourth identity the one that
+matters: a rule written as `cliamp` has to find the stream PipeWire named
+`PipeWire ALSA [cliamp]` and knows nothing about, and vice versa. System services
 (EasyEffects, Quickshell, wireplumber, pipewire, systemd, the portals) are never
 steered.
 
 `set-sink` de-duplicates by identity (not just key), so re-pinning an app whose
 `process.binary` only became visible after the first pin still replaces the old
 rule instead of creating a second one.
+
+The panel lists **one row per app**, not per key. An app can be named three
+different ways at once — PipeWire reports the ALSA client of a program as a
+stream with no `process.binary` at all, so that row is keyed by `node.name`
+while the client and any pin on it are keyed by the binary. Rows are therefore
+folded by identity: a stream and a pin that share any one of those names become
+a single row, and a pinned row is keyed by its pin so its identity does not
+follow a node name that changes. Two unrelated apps that happen to share a name
+stay separate.
+
+A pin left over from an older version that names an internal node — the kind the
+first-word rule used to let through — is not shown. It could not be honoured
+anyway, since the helper refuses to steer a stack name, and drawing it would
+leave a pin you can neither trust nor explain, holding a phantom output row open.
+The rule itself stays in `router-rules.json` until you remove it by name, so
+nothing is discarded behind your back.
+
+`PipeWire ALSA [x]` is PipeWire's wrapper for the ALSA client of an application,
+and **`x` is that application** — on a machine with the terminal music player
+[cliamp](https://github.com/bjarneo/cliamp) installed, that is what the row is.
+Such an app is listed, labelled `cliamp`, and routable like any other. The stack
+is excluded by exact, tag-stripped name only — `pipewire` itself, the session
+manager, the portals, `quickshell`, `systemd`, `EasyEffects` and this plugin's
+own tooling — with no first-word or namespace rule that could quietly swallow
+an application you installed.
+
+To drop a pin, name the app as the panel shows it:
+
+```sh
+python3 assets/omarchy-router remove cliamp
+```
 
 ## Bluetooth / device fallback
 
@@ -223,8 +268,13 @@ different call shapes.
 `selftest` exercises the parsers, matcher, fallback, store mutation, the
 `set-rule`/`set-sink` split and the exclusion/cadence/log policies on canned
 pactl output — no real pactl, no real store — and exits 0/1. Run it after a
-deploy or in CI. It also cross-checks `Panel.qml`'s exclusion list against the
-helper's, so the two copies of that policy cannot drift apart silently.
+deploy or in CI. The exclusion policy is written down once, in `Model.js`'s
+`EXCLUDE_APPS`, and the selftest asserts that `Panel.qml` still holds no copy of
+its own — a second list is exactly how the two drifted before. Both
+implementations are held to the 32 cases in `scripts/exclusion-cases.json`, and
+on the *rule* rather than on the names, because both sides once listed identical
+names while still disagreeing about which to reject. An installed copy has no
+`scripts/` directory and says so rather than reporting a silently weaker run.
 
 ## Development
 

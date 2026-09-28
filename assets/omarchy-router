@@ -42,6 +42,7 @@ can never drop each other's rule.
 """
 
 import fcntl
+import contextlib
 import io
 import json
 import os
@@ -89,11 +90,35 @@ POLL_LINGER = 3.0
 # Stored lowercase and compared through is_excluded_app, never by raw
 # membership: pactl reports "WirePlumber" and "quickshell", so a set holding
 # "wireplumber" and "Quickshell" silently matched neither and let both through
-# as steerable. Kept in sync with Panel.qml's systemBinaries by a selftest that
-# reads that list out of the QML, so editing one side alone fails the suite.
+# as steerable. Kept in sync with Model.js's EXCLUDE_APPS by a selftest that
+# asserts the two agree on the PREDICATE, not merely on the list of names --
+# comparing lists was not enough, because both sides held identical names while
+# still disagreeing about which names to reject.
 EXCLUDE_APPS = {"easyeffects", "quickshell", "wireplumber", "pipewire", "systemd",
                 "pactl", "pw-dump", "python3",
                 "xdg-desktop-portal", "xdg-desktop-portal-hyprland"}
+
+# PipeWire's wrapper name for a client that opened an ALSA PCM: the application
+# is the bracketed part, not PipeWire. A live session here reports
+# "PipeWire ALSA [cliamp]" for the terminal music player cliamp, whose binary is
+# /usr/bin/cliamp -- a real, installed, routable application.
+RE_ALSA_WRAPPER = re.compile(r'^pipewire\s+alsa\s+\[([^\]]{1,64})\]$', re.I)
+
+
+def alsa_client_name(name):
+    """The application named inside a "PipeWire ALSA [app]" wrapper, else "".
+
+    The other half of why EXCLUDE_APPS matches exact names: the wrapper is not
+    the stack, it is the application it carries, so "PipeWire ALSA [cliamp]" is
+    an installed music player and not plumbing.
+    """
+    m = RE_ALSA_WRAPPER.match((name or "").strip())
+    return m.group(1).strip() if m else ""
+
+
+# There is deliberately no namespace rule beside this list -- see
+# is_excluded_app() for why a first-word match was removed rather than kept. A
+# name added here is a name a real session has been seen to report.
 
 RE_APP = re.compile(r'^application\.name\s*=\s*"(.*)"')
 RE_BIN = re.compile(r'^application\.process\.binary\s*=\s*"(.*)"')
@@ -461,11 +486,19 @@ def norm_client_name(s):
 def is_excluded_app(name):
     """True for the audio stack and our own tooling, case-insensitively.
 
-    Single predicate for both call sites: parse_clients (which rows the panel
-    may offer) and is_valid_input (what the watcher will steer and what restore
-    will move). They must agree — a row the panel offers but the matcher
-    refuses to move is a dead end for the user, and the reverse is a stream
-    being dragged somewhere nobody asked for.
+    Single predicate for every call site: parse_clients (which rows the panel
+    may offer), is_valid_input (what the watcher will steer and what restore
+    will move), and the list payload's rule filter. They must agree — a row the
+    panel offers but the matcher refuses to move is a dead end for the user, and
+    the reverse is a stream being dragged somewhere nobody asked for.
+
+    Exact match on the tag-stripped name, and nothing else. This used to be
+    "or the first word is one of the stack's namespaces", a rule to catch stack
+    names not yet seen. It is gone because it could not be tested against any
+    name a real session reports — every one of them is already in EXCLUDE_APPS —
+    while still being free to over-match, and over-matching is how it removed a
+    real installed application (cliamp, reported as "PipeWire ALSA [cliamp]") from
+    the panel. A name added to EXCLUDE_APPS is a name someone has actually seen.
     """
     return norm_client_name(name) in EXCLUDE_APPS
 
@@ -476,11 +509,22 @@ def is_excluded_client(e):
     Both fields are consulted because either can identify the stack: WirePlumber
     arrives as the appName "WirePlumber [client]", and a stream that reports an
     unfamiliar appName but a binary of "wireplumber" is just as much the session
-    manager. Panel.qml already filtered rows on the binary, so checking only the
-    appName here meant the panel and the steering logic could disagree.
+    manager. The panel filters its rows the same way, so the two agree.
     """
     return (is_excluded_app(e.get("appName", ""))
             or is_excluded_app(basename(e.get("binary", ""))))
+
+
+def is_excluded_rule(r):
+    """True for a stored pin that names the audio stack.
+
+    A pin made before the stack was excluded still points at an internal node.
+    It cannot be honoured, so the list payload drops it: the panel shows neither
+    a row for it nor the ghost output row for the sink it was aimed at, and the
+    user is not left with a routing that silently never happens. The rule stays
+    on disk until the user removes it, so nothing of theirs is deleted here.
+    """
+    return is_excluded_app(r.get("app", "")) or is_excluded_app(basename(r.get("binary", "")))
 
 
 def strip_input(s):
@@ -505,23 +549,46 @@ def key_of_r(r):
     return norm(strip_input(r.get("app", "")))
 
 
+def identity_set(r):
+    """Every normalised name a record answers to, as a list.
+
+    An app is the set of identities its records agree on, and two records are the
+    same app when those sets intersect. Order of specificity: process-binary
+    basename, then node.name basename, then application.name with a trailing
+    " input" ignored, then the application named inside a "PipeWire ALSA [app]"
+    wrapper. Mirrors identityList() in Model.js.
+    """
+    b = norm(basename(r.get("binary", "")))
+    n = norm(basename(r.get("nodeName", "") or r.get("node", "")))
+    a = strip_input(r.get("appName", "") or r.get("app", ""))
+    out = []
+    if b:
+        out.append(b)
+    if n and n != b:
+        out.append(n)
+    if a and norm(a) != b and norm(a) != n:
+        out.append(norm(a))
+    w = norm(alsa_client_name(a))
+    if w and w not in out:
+        out.append(w)
+    return out
+
+
 def identities_overlap(a, b):
     """True when two identity dicts (either rule shape {app,binary,node} or
-    stream shape {appName,binary,nodeName}) name the same app. Matched in
-    order of specificity: process-binary basename, then node.name basename,
-    then application.name with a trailing " input" ignored."""
-    ab = norm(basename(a.get("binary", "")))
-    an = norm(basename(a.get("nodeName", "") or a.get("node", "")))
-    aa = norm(strip_input(a.get("appName", "") or a.get("app", "")))
-    bb = norm(basename(b.get("binary", "")))
-    bn = norm(basename(b.get("nodeName", "") or b.get("node", "")))
-    ba = norm(strip_input(b.get("appName", "") or b.get("app", "")))
-    if ab and bb and ab == bb:
-        return True
-    if an and bn and an == bn:
-        return True
-    if aa and ba and aa == ba:
-        return True
+    stream shape {appName,binary,nodeName}) name the same app.
+
+    Set intersection, so any one shared name is enough. That last identity is
+    what lets `remove cliamp` find a rule stored as "PipeWire ALSA [cliamp]":
+    the name a person types is the one the panel shows them, and it is not
+    necessarily the name the rule was written with.
+    """
+    sa = identity_set(a)
+    if not sa:
+        return False
+    for name in sa:
+        if name in identity_set(b):
+            return True
     return False
 
 
@@ -790,6 +857,10 @@ def cmd_list():
     clients = parse_clients(run(["pactl", "list", "clients"]))
     default_sink = run(["pactl", "get-default-sink"]).strip()
     rules = load_rules()
+    # A pin that names the audio stack can never be honoured, so it is not
+    # offered. The rule stays on disk (see is_excluded_rule); dropping it here
+    # only keeps the panel from drawing a row the watcher would refuse to move.
+    rules = [r for r in rules if not is_excluded_rule(r)]
     labels, pending = resolve_sink_labels(sinks, rules)
     if pending:
         # `list` is a read, so this is a side effect worth stating plainly: it
@@ -1184,6 +1255,47 @@ Sink #60
 \tDescription: ThinkPad Dock USB Audio Analog Stereo
 """
 
+# The audio stack's own client, as a live session on this machine reports it.
+# This one genuinely must never be offered as a routable app.
+STACK_INPUT = """Sink Input #2024
+\tapplication.name = "WirePlumber [client]"
+\tapplication.process.binary = "wireplumber"
+\tnode.name = "libpipewire-wireplumber"
+\tMute: no
+\tVolume: 60%
+\tSink: 88
+"""
+
+# A REAL application that happens to sit behind a PipeWire wrapper, exactly as
+# this session reports cliamp: the stream carries no application.process.binary
+# at all, so the panel keys it on node.name while the client keys on the binary.
+# Two keys, one label, one app -- and the wrapper names the application, not
+# PipeWire. Treating the pipewire namespace as plumbing once removed this record
+# from the panel, which is the mistake these fixtures exist to catch.
+ALSA_APP_INPUT = """Sink Input #2025
+\tapplication.name = "PipeWire ALSA [cliamp]"
+\tnode.name = "alsa_playback.cliamp"
+\tMute: no
+\tVolume: 60%
+\tSink: 88
+"""
+
+# One client the payload must drop, and two it must keep. The wireplumber client
+# is the stack; the cliamp client is a real installed music player; Brave is a
+# real application. Only the middle one was ever at risk of being mistaken for
+# the first.
+STACK_CLIENT = """Client #71
+\tapplication.name = "WirePlumber [client]"
+\tapplication.process.binary = "/usr/bin/wireplumber"
+Client #72
+\tapplication.name = "PipeWire ALSA [cliamp]"
+\tapplication.process.binary = "cliamp"
+\tnode.name = "alsa_playback.cliamp"
+Client #73
+\tapplication.name = "Brave input"
+\tapplication.process.binary = "/usr/lib/brave-bin/brave"
+"""
+
 CANONICAL_INPUTS = """Sink Input #2021
 \tApplication: PROCESS.PACKAGE.NAME = "..."
 \tMedia Class: Audio/Video
@@ -1211,6 +1323,34 @@ Sink Input #2023
 """
 
 
+def parse_js_list(js, name):
+    """The string entries of a JS `var NAME = [ "a", "b" ]` in Model.js.
+
+    Read as source text rather than executed: the selftest has no business
+    running a JS engine, and node may not be installed where this runs. The
+    pattern is deliberately narrow -- a single var initialised to a flat list of
+    quoted strings -- so it cannot silently match something else later.
+    """
+    m = re.search(r"var\s+" + re.escape(name) + r"\s*=\s*\[(.*?)\]", js, re.S)
+    if not m:
+        return set()
+    return {norm(x) for x in re.findall(r'"([^"]*)"', m.group(1))}
+
+
+def load_exclusion_cases():
+    """The shared exclusion table, or None when this copy has no scripts/ dir.
+
+    install.sh ships the plugin files only, so an installed helper has no table.
+    """
+    path = os.path.normpath(os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), os.pardir, "scripts", "exclusion-cases.json"))
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)["cases"]
+    except (OSError, ValueError, KeyError):
+        return None
+
+
 def selftest():
     """Zero-I/O sanity checks for the pure parsers and matchers.
 
@@ -1222,6 +1362,7 @@ def selftest():
     # Swapped out (and restored in a finally) for the set-rule store/move
     # separation checks further down.
     global modify_store, move_matching, run, load_state, bluetooth_labels
+    global load_rules, resolve_sink_labels
 
     def check(name, got, want):
         ok = got == want
@@ -1657,6 +1798,10 @@ def selftest():
     check("replace_rule unpinned sink never persisted", all(r["sink"] != "__default__" for r in removed), True)
 
     check("strip_input", strip_input("Signal input"), "Signal")
+    # The suffix test runs on a lowercased copy, so a session capitalising it is
+    # still recognised. Nothing else here would notice that difference.
+    check("strip_input ignores the case of the suffix", strip_input("Signal Input"), "Signal")
+    check("strip_input capitalised, with the artifact", strip_input("Brave (deleted) Input"), "Brave")
     check("basename", basename("/usr/lib/brave-bin/brave"), "brave")
 
     # PipeWire's " (deleted)" artifact, as seen on a live Brave stream after the
@@ -1732,6 +1877,41 @@ def selftest():
         cmd_set("mpv", "", "mpv", "__default__")
         check("set-sink __default__: resolves default", box["moves"], [("mpv", "", "mpv", dflt)])
         check("set-sink __default__: asked pactl", box["runs"][0], ["pactl", "get-default-sink"])
+
+        # `remove <app>` is documented with the app name alone -- no binary, no
+        # node. That has to delete the rule it names and leave everything else,
+        # and it must not leave a rule pinned to the default behind: "no longer
+        # pinned" and "pinned to the default sink" are different things to store.
+        # The victim is a stale rule naming the audio stack, which is the case
+        # worth being able to clean up by hand.
+        stack_store = [
+            {"app": "Brave", "binary": "brave", "node": "", "sink": "alsa_output.rode"},
+            {"app": "PipeWire ALSA [cliamp]", "binary": "cliamp", "node": "",
+             "sink": "alsa_output.komplete"},
+        ]
+
+        def fake_modify_store_stack(mutator):
+            box["rules"] = mutator(list(stack_store))
+
+        modify_store = fake_modify_store_stack
+        box["moves"].clear()
+        # Named by binary, not by the wrapper the panel shows: the stored rule's
+        # app field is however it was written, and remove matches on identity.
+        cmd_remove("cliamp")
+        check("remove: deletes the rule it names by app alone",
+              [key_of_r(r) for r in box["rules"]], ["brave"])
+        check("remove: leaves no default-pinned rule behind",
+              any(r["sink"] == "__default__" for r in box["rules"]), False)
+        check("remove: keep the rest intact", box["rules"][0]["sink"], "alsa_output.rode")
+
+        # The reverse spelling must work too: the panel shows "cliamp", so a
+        # person removes by that, while the rule on disk is named by the
+        # wrapper. Matching only identical strings would leave the pin behind
+        # and tell the user it was gone.
+        modify_store = fake_modify_store_stack
+        cmd_remove("PipeWire ALSA [cliamp]")
+        check("remove: also matches the name the panel shows",
+              [key_of_r(r) for r in box["rules"]], ["brave"])
     finally:
         modify_store, move_matching, run = real_modify_store, real_move_matching, real_run
 
@@ -2021,22 +2201,378 @@ Client #13
     check("parse_clients drops a stack client by binary",
           [c["appName"] for c in parse_clients(_mixed)], ["Brave input"])
 
-    # The same policy is duplicated in Panel.qml so the panel can hide rows
-    # without a round trip. Two copies of one policy drift, which is exactly
-    # how the case bug above survived, so read that list back and compare.
-    # Panel.qml sits beside the helper's directory in both supported layouts:
-    # <repo>/Panel.qml next to <repo>/assets/, and the installed plugin dir.
-    panel_qml = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "Panel.qml"))
+    # The same policy is duplicated in Model.js so the panel can hide rows
+    # without a round trip. Two copies of one policy drift, which is exactly how
+    # the case bug above survived, so read that copy back and compare. Model.js
+    # sits beside the helper's directory in both supported layouts: <repo>/
+    # Model.js next to <repo>/assets/, and the installed plugin dir.
+    model_js = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "Model.js"))
     try:
-        with open(panel_qml, encoding="utf-8") as f:
-            qml_line = next((ln for ln in f if "var list = [" in ln), "")
-        qml_list = {norm(x) for x in re.findall(r'"([^"]+)"', qml_line)}
-        check("panel exclusion list matches EXCLUDE_APPS",
-              sorted(qml_list - EXCLUDE_APPS), sorted(EXCLUDE_APPS - qml_list))
+        with open(model_js, encoding="utf-8") as f:
+            js = f.read()
+        check("Model.js exclusion list matches EXCLUDE_APPS",
+              sorted(parse_js_list(js, "EXCLUDE_APPS") - EXCLUDE_APPS),
+              sorted(EXCLUDE_APPS - parse_js_list(js, "EXCLUDE_APPS")))
+        # The namespace rule is gone from both sides, and that is the point: it
+        # could not be tested against any name a real session reports, while
+        # being free to over-match, and it removed a real installed application
+        # from the panel. A guard that fails if either side grows a prefix list
+        # again, so the "just cover names we have not seen yet" argument has to
+        # be answered with a name rather than a heuristic.
+        check("no stack-namespace list has returned on either side",
+              [bool(re.search(r"var\s+STACK_NAME_PREFIXES\s*=", js)),
+               bool(re.search(r"^STACK_NAME_PREFIXES\s*=",
+                              open(os.path.abspath(__file__), encoding="utf-8").read(), re.M))],
+              [False, False])
     except OSError as ex:
         # Supported layouts always have it; failing loudly beats silently
         # skipping the only guard against the two copies drifting apart.
-        check("panel exclusion list readable", f"unreadable: {ex}", "readable")
+        check("Model.js exclusion policy readable", f"unreadable: {ex}", "readable")
+
+    # The lists can be identical and the predicates still disagree, so the real
+    # guard is a shared table of expected verdicts that both implementations are
+    # held to: scripts/exclusion-cases.json. scripts/model-test.js asserts the
+    # same file against Model.js.
+    cases = load_exclusion_cases()
+    if cases is None:
+        # install.sh ships the plugin files and not scripts/, so an installed
+        # copy has no table. Said out loud rather than skipped silently: a run
+        # reporting zero cross-language cases is a weaker run, and that should
+        # be visible in the output.
+        say("selftest: no scripts/exclusion-cases.json here (installed layout) "
+            "- cross-language exclusion cases not run in this copy")
+    else:
+        wrong = []
+        for c in cases:
+            got = is_excluded_client({"appName": c.get("appName", ""), "binary": c.get("binary", "")})
+            if got != c["excluded"]:
+                wrong.append(f"{c.get('appName')!r}/{c.get('binary')!r} expected {c['excluded']} got {got}")
+        check(f"exclusion policy matches the shared table ({len(cases)} cases)", wrong, [])
+        # A pin naming the stack is dropped from the list payload; the same has
+        # to hold for the rule shape, which carries app/binary and not
+        # appName/binary. And a real application behind the PipeWire wrapper must
+        # come through the same predicate, in the same call, with the opposite
+        # answer.
+        check("is_excluded_rule reads a rule's app",
+              [is_excluded_rule({"app": "WirePlumber [client]", "binary": "wireplumber"}),
+               is_excluded_rule({"app": "PipeWire ALSA [cliamp]", "binary": "cliamp"}),
+               is_excluded_rule({"app": "Brave", "binary": "brave"})],
+              [True, False, False])
+
+        # identity_set() is the helper's half of the fold, so the unwrapped
+        # application name has to be in it or a rule stored under the wrapper
+        # stops matching a record that reports the bare name -- which is the
+        # duplicate-row bug this release fixes, arriving by another route.
+        check("identity_set carries the app inside a PipeWire wrapper",
+              "cliamp" in identity_set({"app": "PipeWire ALSA [cliamp]", "binary": "cliamp"}), True)
+        check("and a wrapper stream keyed only on its node",
+              sorted(identity_set({"appName": "PipeWire ALSA [cliamp]", "binary": "",
+                                   "nodeName": "alsa_playback.cliamp"})),
+              ["alsa_playback.cliamp", "cliamp", "pipewire alsa [cliamp]"])
+        check("a wrapper and a bare name are the same app either way round",
+              [identities_overlap({"app": "PipeWire ALSA [cliamp]", "binary": "cliamp"},
+                                  {"appName": "cliamp", "binary": ""}),
+               identities_overlap({"appName": "cliamp", "binary": ""},
+                                  {"app": "PipeWire ALSA [cliamp]", "binary": "cliamp"})],
+              [True, True])
+        check("two different ALSA apps behind two wrappers are not",
+              identities_overlap({"app": "PipeWire ALSA [cliamp]", "binary": "cliamp"},
+                                 {"appName": "PipeWire ALSA [mpv]", "binary": "mpv"}), False)
+
+    # Model.js is unit-tested, but the panel's use of it is not reachable from
+    # node: buildRows() is inline in a .qml file. These are source-level checks,
+    # the same kind this suite already makes against Panel.qml, and they exist
+    # because the fold is the fix. Reverting the call in Panel.qml would leave
+    # every unit test green while the duplicate row came straight back.
+    try:
+        with open(model_js, encoding="utf-8") as f:
+            model_src = f.read()
+        with open(os.path.normpath(os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), os.pardir, "Panel.qml")),
+                encoding="utf-8") as f:
+            panel_src = f.read()
+        check("Panel.qml folds rows with Model.mergeRows",
+              panel_src.count("Model.mergeRows("), 1)
+        # The one QML copy of the denylist moved into Model.js. Its presence
+        # here again is what let the two drift. Matched on the shape it had --
+        # a var initialised to a list of quoted names -- rather than on any
+        # "var list = [", which an unrelated empty list also matches.
+        check("Panel.qml holds no denylist of its own",
+              re.findall(r'var\s+\w*[Ll]ist\w*\s*=\s*\[\s*"', panel_src), [])
+        check("Panel.qml filters rules through the shared predicate",
+              panel_src.count("Model.isExcludedClient("), 2)
+        # Every row labels through one function. buildRows() names a row from
+        # three kinds of record -- a stream, a pin, and a client with no stream --
+        # and an ALSA application is called "PipeWire ALSA [app]" in all three,
+        # so a label taken from any other expression reads "PipeWire ALSA
+        # [cliamp]" and looks like a piece of the audio stack rather than the
+        # player it is. The fourth call is the runIdle label upgrade, which
+        # rewrites an existing row's label and must not reintroduce the wrapper.
+        # Not reachable from node, like the fold above, so guarded as source.
+        check("Panel.qml labels every row through friendlyLabel",
+              panel_src.count("Model.friendlyLabel("), 4)
+
+        # ---- layout: the circle and the two row grids -----------------------
+        # Same reasoning as the fold above: none of this is reachable from node,
+        # and each of these is a way the layout can silently regress while every
+        # unit test still passes.
+
+        def qml_strip_comments(text):
+            """QML source with // comments and /* */ blocks removed.
+
+            The layout guards assert on the absence of a token, so a comment
+            that merely *names* that token fails the check for the wrong reason.
+            Worse, it would start passing again the moment the comment is
+            reworded while the code underneath stayed broken -- a guard that
+            reads prose returns an answer that depends on how the fix was
+            written up rather than on what the code does. These have to see code
+            only.
+
+            String literals are copied through untouched, which takes real
+            care rather than a regex: Panel.qml contains "file://" and
+            backticks, so a stripper that treated any "//" as a comment would
+            quietly truncate those lines and hand a later guard a function body
+            that ends mid-expression.
+            """
+            out = []
+            i, n = 0, len(text)
+            while i < n:
+                ch = text[i]
+                if ch in "\"'`":
+                    # Copy the whole literal, honouring backslash escapes, so
+                    # an escaped quote cannot end it early.
+                    quote = ch
+                    out.append(ch)
+                    i += 1
+                    while i < n:
+                        c = text[i]
+                        out.append(c)
+                        i += 1
+                        if c == "\\" and i < n:
+                            out.append(text[i])
+                            i += 1
+                        elif c == quote:
+                            break
+                    continue
+                two = text[i:i + 2]
+                if two == "//":
+                    nl = text.find("\n", i)
+                    i = n if nl < 0 else nl
+                elif two == "/*":
+                    end = text.find("*/", i + 2)
+                    i = n if end < 0 else end + 2
+                    # Keep a space so stripping cannot glue two tokens together
+                    # and invent one that was never in the source.
+                    out.append(" ")
+                else:
+                    out.append(ch)
+                    i += 1
+            return "".join(out)
+
+        def qml_fn(name):
+            """The source text of one Panel.qml function, braces balanced."""
+            start = panel_src.find("  function %s(" % name)
+            if start < 0:
+                return ""
+            i = panel_src.find("{", start)
+            depth = 0
+            while i < len(panel_src):
+                if panel_src[i] == "{":
+                    depth += 1
+                elif panel_src[i] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return qml_strip_comments(panel_src[start:i + 1])
+                i += 1
+            return ""
+
+        def qml_block(ident):
+            """The source text of the QML block carrying `id: ident`."""
+            at = panel_src.find("id: %s" % ident)
+            if at < 0:
+                return ""
+            start = panel_src.rfind("{", 0, at)
+            i = panel_src.find("{", start)
+            depth = 0
+            while i < len(panel_src):
+                if panel_src[i] == "{":
+                    depth += 1
+                elif panel_src[i] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return qml_strip_comments(panel_src[start:i + 1])
+                i += 1
+            return ""
+
+        # The circle moved next to its name, so nothing may position it from the
+        # column edge any more. It used to be appCol.width - appGutter - 3.
+        check("the drawn circle's x comes from the shared formula",
+              "root.appDotXForWidth(" in qml_block("appDot"), True)
+        check("the removed right-hand gutter is gone with it",
+              "appGutter" in panel_src, False)
+        # The ring's hitbox, the patch line's endpoint and the drag ghost all
+        # read where the delegate actually drew the circle, so they cannot
+        # disagree with it. Three readers: badgeHit, dotCenterFor, the ghost.
+        check("the circle's position has one owner and three readers",
+              panel_src.count("root.appDotXFor("), 3)
+        # Output rows are two lines tall, so they no longer share the app grid.
+        # Anything that turns an output index into a y has to use the output
+        # step, or it points at the wrong row.
+        check("output hit-testing indexes by the output row step",
+              bool(re.search(r"Math\.floor\(y\s*/\s*root\.outRowStep\)", qml_fn("outputAt"))),
+              True)
+        check("the output dot's y uses the output row step",
+              "root.outRowStep" in qml_fn("dotCenterFor"), True)
+        check("scrolling the cursor uses the step of the column it is in",
+              'root.cursorSection === "outputs" ? root.outRowStep' in qml_fn("ensureCursorVisible"),
+              True)
+        # Both columns share one Item, so its height has to be the taller of the
+        # two grids. Sizing it from the app step alone clips the bottom of a
+        # longer output list.
+        check("the patch area is tall enough for the taller output rows",
+              "root.outputRows.length * root.outRowStep" in qml_block("patchArea"), True)
+        # Output names wrap rather than ellipsize, because an output name's tail
+        # is the informative end. maximumLineCount is the floor under the row
+        # height: without it a pathological name spills out of its row instead
+        # of degrading to an ellipsis. Both scoped to the output label, since
+        # the status note above wraps too and would satisfy a whole-file search.
+        out_label = qml_block("outLabel")
+        check("output labels wrap instead of eliding",
+              "wrapMode: Text.WordWrap" in out_label, True)
+        check("and keep a two-line floor so a long name cannot overflow",
+              re.findall(r"maximumLineCount:\s*(\d+)", out_label), ["2"])
+        # The output dot is anchored to the label's first line, so a wrapped
+        # name's icon belongs to line 1 rather than floating in the gap between
+        # the lines. Scoped to the dot's own block, and the row height is banned
+        # there outright: outLabel.y is already row-relative, so combining it
+        # with outRowH double-counts the offset and lifts the dot out of its row.
+        out_dot = qml_block("outDot")
+        check("the output dot is anchored to the label's first line",
+              "outLabel.y" in out_dot, True)
+        check("and never mixes in the row height on top of it",
+              "outRowH" in out_dot, False)
+        # lineHeight is a multiplier under the default ProportionalHeight mode,
+        # not pixels, so reaching for it here collapses the offset to 0.5px and
+        # silently drops the dot onto the block's top edge.
+        check("the output dot's line offset is read in pixels, not as a multiplier",
+              "lineHeight" in out_dot, False)
+        # One owner, one reader. The patch canvas draws its endpoint behind the
+        # columns, so a connected output shows one dot only while the passive dot
+        # and the line endpoint occupy the same pixel. A reader that recomputes
+        # its own y brings the second dot straight back, so the reader has to be
+        # the published map rather than a fresh row-centre calculation.
+        check("a connected output cannot grow a second dot",
+              "root.outDotCenterY(" in qml_fn("dotCenterFor"), True)
+        check("the output dot's position has one owner and three readers",
+              panel_src.count("root._outDotY["), 3)
+        # The offset has to be a fraction of the font size, not a pixel count:
+        # a hardcoded pixel offset does not follow the font scale, so the dot
+        # lands off line 1 as soon as the user changes it. The accepted range is
+        # half a line box for line spacings of 1.0em to 1.6em, which is where
+        # "aligned to the first line" stops meaning anything else. The exact
+        # value is a design choice, not a contract, so it is not pinned.
+        m_off = re.search(r"outLabel\.font\.pixelSize\s*\*\s*([0-9.]+)", out_dot)
+        check("the output dot's offset scales with the font rather than a pixel count",
+              bool(m_off), True)
+        check("and that fraction still means half a line box",
+              m_off is not None and 0.4 <= float(m_off.group(1)) <= 0.8, True)
+        # Everything above is pointless if the published number is the dot's top
+        # edge instead of its centre: the canvas then draws its endpoint 3px
+        # above the passive dot, which is the same split the alignment fixes,
+        # three times smaller. Both publish sites have to add the radius.
+        check("the delegate publishes the dot's centre, not its top edge",
+              [len(re.findall(r"noteOutDotY\(\s*\w+\.okey\s*,\s*outDot\.y\s*\+\s*3\s*\)", panel_src)),
+               len(re.findall(r"noteOutDotY\(\s*\w+\.okey\s*,\s*y\s*\+\s*3\s*\)", panel_src))],
+              [1, 1])
+        # A label re-wraps without the row changing shape (theme or font-scale
+        # change, an output coming back online), so the position has to be
+        # republished on a y change and not only when the delegate is built.
+        check("the output dot republishes when the label re-wraps",
+              "onYChanged: root.noteOutDotY(" in out_dot, True)
+        # _outDotY is mutated in place, so the Canvas's dependency on it never
+        # fires. Without an explicit repaint the line keeps pointing where the
+        # dot used to be until something else happens to redraw the canvas.
+        check("writing the output dot's position repaints the canvas",
+              "repaintPatch()" in qml_fn("noteOutDotY"), True)
+        # The canvas is declared after the columns, so it is still undefined
+        # while the first row's delegate reports in. Calling requestPaint()
+        # through an unguarded reference throws a TypeError per row on every
+        # panel open, and the repaint is the only thing that call does -- the
+        # position is already written by then, so the symptom is a silent
+        # failure wrapped in a burst of errors, which is the worst kind.
+        check("the repaint tolerates the canvas not existing yet",
+              bool(re.search(r"if\s*\(\s*!root\.linkCanvas\s*\)\s*return", qml_fn("repaintPatch"))),
+              True)
+        # And it must coalesce: a panel full of rows reporting in the same frame
+        # should cost one repaint, not one per row.
+        check("the repaint coalesces a frame's worth of rows",
+              bool(re.search(r"if\s*\(\s*root\._repaintQueued\s*\)\s*return", qml_fn("repaintPatch"))),
+              True)
+    except OSError as ex:
+        check("Panel.qml readable for the fold checks", f"unreadable: {ex}", "readable")
+
+    # The whole payload, end to end, in the shape the panel consumes: the three
+    # filtered collections plus the rules. Each filter has its own unit test, and
+    # this is what catches one of them being dropped from cmd_list itself --
+    # which is how a stack rule stayed in the payload while every predicate
+    # around it was correct.
+    real_run, real_rules, real_labels = run, load_rules, resolve_sink_labels
+
+    def list_run(cmd, **kwargs):
+        # run() returns decoded text, not a subprocess object: this stubs run()
+        # itself, not subprocess.run().
+        if cmd[1:] == ["list", "sinks"]:
+            return CANONICAL_SINKS
+        if cmd[1:] == ["list", "sink-inputs"]:
+            return CANONICAL_INPUTS + STACK_INPUT + ALSA_APP_INPUT
+        if cmd[1:] == ["list", "clients"]:
+            return STACK_CLIENT
+        if cmd[1:] == ["get-default-sink"]:
+            return "alsa_output.pci-0000_00_1f.3.analog-stereo\n"
+        return ""
+
+    try:
+        run = list_run
+        load_rules = lambda: [
+            {"app": "Brave", "binary": "brave", "node": "", "sink": "alsa_output.pci-0000_00_1f.3.analog-stereo"},
+            {"app": "WirePlumber [client]", "binary": "wireplumber", "node": "",
+             "sink": "bluez_output.24_06_11_A5_E7_95.1"},
+            {"app": "PipeWire ALSA [cliamp]", "binary": "cliamp", "node": "",
+             "sink": "alsa_output.usb-Generic_ThinkPad_Dock_USB_Audio-00.analog-stereo"},
+        ]
+        # No state file is read or written: label resolution is the one part of
+        # cmd_list that touches disk, and the selftest has no business doing that.
+        resolve_sink_labels = lambda sinks, rules: ({}, [])
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cmd_list()
+        payload = json.loads(buf.getvalue())
+        ins = [e["appName"] for e in payload["sinkInputs"]]
+        cls = [c["appName"] for c in payload["clients"]]
+        # The stack is dropped, in all three collections.
+        check("payload drops a pin naming the audio stack",
+              [r["app"] for r in payload["rules"] if r["app"] == "WirePlumber [client]"], [])
+        check("payload drops the stack's own stream",
+              [n for n in ins if n.startswith("WirePlumber")], [])
+        check("payload drops the stack from its clients",
+              [n for n in cls if n.startswith("WirePlumber")], [])
+        # A real application behind the same PipePipeWire wrapper is kept. These
+        # two groups are one assertion split in two on purpose: an exclusion rule
+        # broad enough to catch the first also caught the second, and that is how
+        # an installed music player was removed from the panel.
+        check("payload keeps a real app behind a PipeWire wrapper: its stream",
+              "PipeWire ALSA [cliamp]" in ins, True)
+        check("payload keeps a real app behind a PipeWire wrapper: its client",
+              "PipeWire ALSA [cliamp]" in cls, True)
+        check("payload keeps a real app behind a PipeWire wrapper: its pin",
+              [r["app"] for r in payload["rules"] if r["app"] == "PipeWire ALSA [cliamp]"],
+              ["PipeWire ALSA [cliamp]"])
+        check("payload keeps a real app's stream and client",
+              ["Brave" in ins, "Brave input" in cls], [True, True])
+        check("payload still carries the bluetooth alias map",
+              isinstance(payload.get("sinkAliases"), dict), True)
+    finally:
+        run, load_rules, resolve_sink_labels = real_run, real_rules, real_labels
 
     failed = [name for name, ok in checks if not ok]
     print(f"selftest: {len(checks) - len(failed)}/{len(checks)} passed")

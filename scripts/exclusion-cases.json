@@ -1,0 +1,221 @@
+{
+  "_comment": [
+    "What the audio stack is, as data both implementations are held to.",
+    "",
+    "The exclusion rule is duplicated by hand in assets/omarchy-router",
+    "(is_excluded_client) and Model.js (isExcludedClient), and the two had",
+    "drifted: they held identical name lists while disagreeing about which",
+    "names to reject, so comparing the lists proved nothing. These cases are",
+    "the shared expectation -- assets/omarchy-router selftest and",
+    "scripts/model-test.js each assert their own implementation against this",
+    "file, so changing one side alone fails that side's own suite.",
+    "",
+    "'excluded' is what both must answer for the given (appName, binary).",
+    "",
+    "Matching is EXACT on the tag-stripped name. There is no namespace or",
+    "prefix rule, on either side, and that is deliberate. A first-word rule was",
+    "here to cover stack names not yet seen; it could not be tested against any",
+    "name a real session reports, because every one of them is already on the",
+    "list, while still being free to over-match -- and it did. 'PipeWire ALSA",
+    "[app]' is PipeWire's wrapper for the ALSA client of an application, and the",
+    "bracketed part IS a real installed app (cliamp, a music player, on the",
+    "machine that reported it). Treating the pipewire namespace as plumbing",
+    "deleted that app from the panel. The 'why' on each case records which side",
+    "of that line the name falls on, so the same mistake cannot be re-derived",
+    "from a plausible-looking example again."
+  ],
+  "cases": [
+    {
+      "appName": "WirePlumber",
+      "binary": "wireplumber",
+      "excluded": true,
+      "why": "the session manager, spelled the way pactl spells it"
+    },
+    {
+      "appName": "WirePlumber",
+      "binary": "",
+      "excluded": true,
+      "why": "name only, capitalised, no binary to fall back on. Every other case that capitalises a stack name also carries the lowercase binary, so this is the one that fails if case-insensitivity is dropped"
+    },
+    {
+      "appName": "WirePlumber [client]",
+      "binary": "wireplumber",
+      "excluded": true,
+      "why": "same daemon, tagged; the tag is stripped before matching"
+    },
+    {
+      "appName": "wireplumber",
+      "binary": "",
+      "excluded": true,
+      "why": "name alone, no binary reported"
+    },
+    {
+      "appName": "quickshell",
+      "binary": "quickshell",
+      "excluded": true,
+      "why": "the bar itself"
+    },
+    {
+      "appName": "quickshell [client]",
+      "binary": "quickshell",
+      "excluded": true,
+      "why": "tagged spelling"
+    },
+    {
+      "appName": "pipewire",
+      "binary": "pipewire",
+      "excluded": true,
+      "why": "the daemon"
+    },
+    {
+      "appName": "PipeWire",
+      "binary": "",
+      "excluded": true,
+      "why": "the daemon as PipeWire capitalises it, with no binary reported: matched on name alone"
+    },
+    {
+      "appName": "PipeWire ALSA [cliamp]",
+      "binary": "cliamp",
+      "excluded": false,
+      "why": "a REAL installed application: pacman owns cliamp 2.0.1, 'A retro terminal music player', and this is the name PipeWire gives it. Excluding the pipewire namespace as plumbing deleted it from the panel. The binary is the player, not a driver"
+    },
+    {
+      "appName": "PipeWire ALSA [mpv]",
+      "binary": "mpv",
+      "excluded": false,
+      "why": "a second real ALSA application, so the rule is pinned for the family and not for the one instance that was noticed"
+    },
+    {
+      "appName": "PipeWire ALSA [loopback]",
+      "binary": "",
+      "excluded": false,
+      "why": "same wrapper family, same verdict: the application is whatever is in the brackets, so this must not be excluded by namespace"
+    },
+    {
+      "appName": "PipeWire ALSA",
+      "binary": "",
+      "excluded": false,
+      "why": "the wrapper without a PCM name is still not the daemon; only the bare 'pipewire' name is, and that case is listed above as excluded"
+    },
+    {
+      "appName": "pactl",
+      "binary": "pactl",
+      "excluded": true,
+      "why": "our own tooling"
+    },
+    {
+      "appName": "python3",
+      "binary": "python3",
+      "excluded": true,
+      "why": "our own tooling, under either spelling"
+    },
+    {
+      "appName": "xdg-desktop-portal",
+      "binary": "xdg-desktop-portal",
+      "excluded": true,
+      "why": "portal"
+    },
+    {
+      "appName": "xdg-desktop-portal-hyprland",
+      "binary": "xdg-desktop-portal-hyprland",
+      "excluded": true,
+      "why": "portal"
+    },
+    {
+      "appName": "easyeffects",
+      "binary": "easyeffects",
+      "excluded": true,
+      "why": "an audio effect chain must not be routed"
+    },
+    {
+      "appName": "systemd",
+      "binary": "systemd",
+      "excluded": true,
+      "why": "our own tooling"
+    },
+    {
+      "appName": "Mystery",
+      "binary": "wireplumber",
+      "excluded": true,
+      "why": "an unfamiliar name does not launder a known binary"
+    },
+    {
+      "appName": "quickshell [client]",
+      "binary": "",
+      "excluded": true,
+      "why": "robustness, not an observation: with no binary to fall back on, a tag must not defeat the denylist. The namespace rule already covers PipeWire and WirePlumber whatever the tag does, so only the non-stack names depend on the tag being stripped"
+    },
+    {
+      "appName": "pactl [monitor]",
+      "binary": "",
+      "excluded": true,
+      "why": "as above, for our own tooling"
+    },
+    {
+      "appName": "Brave input",
+      "binary": "brave",
+      "excluded": false,
+      "why": "a real application"
+    },
+    {
+      "appName": "Brave",
+      "binary": "brave",
+      "excluded": false,
+      "why": "a real application"
+    },
+    {
+      "appName": "Brave (deleted) input",
+      "binary": "brave",
+      "excluded": false,
+      "why": "the (deleted) artifact is not an exclusion"
+    },
+    {
+      "appName": "Signal",
+      "binary": "signal-desktop",
+      "excluded": false,
+      "why": "a real application"
+    },
+    {
+      "appName": "ringrtc",
+      "binary": "signal-desktop",
+      "excluded": false,
+      "why": "Signal's voice engine; shown under Signal, never routed as itself"
+    },
+    {
+      "appName": "Mystery",
+      "binary": "",
+      "excluded": false,
+      "why": "unknown apps are routable; that is the whole point"
+    },
+    {
+      "appName": "Spotify",
+      "binary": "spotify",
+      "excluded": false,
+      "why": "a real application"
+    },
+    {
+      "appName": "Quickshell Notes",
+      "binary": "quickshell-notes",
+      "excluded": false,
+      "why": "the stack's names are matched exactly, so a different application that merely shares a word with one is untouched -- 'quickshell-notes' is not 'quickshell'"
+    },
+    {
+      "appName": "MyPipeWire Viewer",
+      "binary": "mypipewire",
+      "excluded": false,
+      "why": "contains 'pipewire' but is not 'pipewire'; exact matching means a name is only ever excluded when the whole normalised name is on the list"
+    },
+    {
+      "appName": "WirePlumber Dashboard",
+      "binary": "wp-dash",
+      "excluded": false,
+      "why": "a DIFFERENT application that merely starts with a stack name. This is the case a first-word namespace rule got wrong in the other direction, and the reason matching is exact: a stack name is added when a session actually reports one"
+    },
+    {
+      "appName": "",
+      "binary": "",
+      "excluded": false,
+      "why": "an empty record is not the audio stack"
+    }
+  ]
+}

@@ -57,7 +57,8 @@ Bluetooth device names — deleting it is how you clear that history.
 
 ## Usage
 
-Click the link icon (right side of the bar) to open the patchbay.
+Click the link icon (right side of the bar) to open the patchbay, or press your
+bar's panel hotkey — see *Keyboard*.
 
 - **Route:** drag an app row onto an output column.
 - **Reset to default:** drag onto the current default output row or click the
@@ -87,18 +88,28 @@ dragged by accident.
 
 ## Keyboard
 
-The panel is fully drivable without a mouse. The first arrow press only wakes
-the cursor — it does not move or scroll, so the panel never jumps on a stray
-keypress.
+The panel opens like any other bar widget: click the link icon, or use the bar's
+panel hotkey — `SUPER + CTRL + 1`–`9` toggles the first through ninth panel in
+the bar's right section. The number counts panel icons left to right, skipping
+widgets that have no panel of their own (the tray) and any that are hidden, so it
+is the Nth icon you can actually see rather than a fixed key: this is
+`SUPER + CTRL + 1` only while the router is the first panel on your bar.
+`omarchy menu keybindings --print` lists the range as `Bar panel N`. For a key
+that does not depend on bar order, bind your own to
+`omarchy-shell shell toggle petealeon.router`.
+
+Once open the panel is fully drivable without a mouse. The first arrow press only
+wakes the cursor — it does not move or scroll, so the panel never jumps on a
+stray keypress.
 
 | Key | Action |
 | --- | --- |
-| `j` / `Down`, `k` / `Up` | Move the cursor a row (crosses into the header from the first row) |
+| `j` / `Down`, `k` / `Up` | Move the cursor a row. From the first app row, up enters the header; from the header, down returns to the app list |
 | `l` / `Right` | From an app row: jump to the output it is connected to, ready to re-route |
 | `h` / `Left` | Back to the app row from the output column |
 | `Return` / `Space` | On the header: toggle routing. On an output: route the app to it |
 | `x` | Reset the app to the system default (same as clicking its ring) |
-| `1`–`9` | Route the app to the nth output without walking the column |
+| `1`–`9` | Route the app under the cursor to the nth output without walking the column. From the header it applies to the last app the cursor was on, or the first app if it was never in the list |
 | `Tab`, `Shift+Tab` | Next / previous panel |
 | `Escape` | Close |
 

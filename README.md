@@ -1,4 +1,4 @@
-# petealeon.router — Audio Router
+# Audio Router
 
 Persistent per-app audio routing for the Omarchy shell. A dedicated bar icon
 opens a two-column patchbay; drag any app onto any output (or click-click) to
@@ -6,12 +6,24 @@ route it. Pinned routes live on disk and are reasserted continuously, so a pin
 made while an app is silent kicks in the moment that app starts playing — and
 survives reboots.
 
-- **Bar widget:** `petealeon.router` (BarWidget.qml + Panel.qml + Model.js)
-- **Watcher/helper:** `assets/omarchy-router` (pure-python, no dependencies
-  beyond `pactl`; `bluetoothctl` optional — see *Requirements*)
-- **Rules store:** `~/.config/omarchy/router-rules.json`
-- **State:** `~/.config/omarchy/petealeon-router.json` (on/off preference and cached
-  Bluetooth device names — see *Data and privacy*)
+![Audio Router in action — drag an app onto an output, or route with the keyboard badges](screenshots/screenshot-2026-09-29_12-29-12.png)
+
+## Highlights
+
+- **It sticks.** Pinned routes are reasserted continuously and survive reboots,
+  so a pin you made while an app was silent applies from the first moment it
+  plays.
+- **Route by eye, not by ID.** One row per app, real output names shown in
+  full, no raw PipeWire node strings — drag, click, or type.
+- **Tune up before the call.** Every app is listed whether or not it is playing,
+  so you can pre-pin the whole desk before any audio starts moving.
+- **Keyboard-native.** Every row carries its shortcut: a letter picks the app,
+  a number routes it, `r` toggles routing on and off.
+- **Bluetooth that behaves.** Rules follow the device rather than the profile,
+  so reconnects don't drop you to the laptop speakers, and disconnects return to
+  the default output instead of muting into a vanished headset.
+- **Private by design.** No network connections, no telemetry. Your pins live in
+  two local files you can wipe with `--purge` (see *Privacy and data*).
 
 ## Requirements
 
@@ -73,24 +85,19 @@ bar's panel hotkey — see *Keyboard*.
   switch comes back on. Resets still apply immediately, since "everything is
   already on the default" is what off means.
 
-Every PipeWire client is listed, whether or not it is playing right now — the
-left column is a stable set you can pre-pin, not a live activity feed; rows
-with an active stream draw at full weight, idle ones are dimmed. System
-services (quickshell, wireplumber, pipewire, the portals, EasyEffects) are
-never listed and never steered, so there is nothing to pre-pin *of those* and
-nothing that can be dragged by accident.
+Every audio client is listed, whether or not it is playing right now — the left
+column is a stable set you can pre-pin, not a live activity feed; rows with an
+active stream draw at full weight, idle ones are dimmed. System services
+(quickshell, wireplumber, pipewire, the portals, EasyEffects) are never listed
+and never steered, so there is nothing to pre-pin *of those* and nothing that
+can be dragged by accident.
 
 ## Keyboard
 
-The panel opens like any other bar widget: click the link icon, or use the bar's
-panel hotkey — `SUPER + CTRL + 1`–`9` toggles the first through ninth panel in
-the bar's right section. The number counts panel icons left to right, skipping
-widgets that have no panel of their own (the tray) and any that are hidden, so it
-is the Nth icon you can actually see rather than a fixed key: this is
-`SUPER + CTRL + 1` only while the router is the first panel on your bar.
-`omarchy menu keybindings --print` lists the range as `Bar panel N`. For a key
-that does not depend on bar order, bind your own to
-`omarchy-shell shell toggle petealeon.router`.
+The panel opens like any other bar widget: click the link icon, or press your
+bar's panel hotkey (in Omarchy the bindings are listed as `Bar panel N`, e.g.
+`SUPER + CTRL + 1`). If you'd rather not depend on bar order, bind your own key
+to `omarchy-shell shell toggle petealeon.router`.
 
 Once open the panel is fully drivable without a mouse. The first arrow press only
 wakes the cursor — it does not move or scroll, so the panel never jumps on a
@@ -131,7 +138,62 @@ The cursor spans both columns, so moving right lands on the output the app is
 currently on and left comes back to where it was. Both columns' rows share one
 height, so a source and the output beside it stay on the same line.
 
-## Rule matching
+## Bluetooth devices
+
+- **Disconnects fall back cleanly.** If a pinned device goes away (e.g. a
+  headset powers off), the next poll moves its streams to the *system default*
+  instead of leaving them muted on the vanished device — and the rule is kept,
+  so when the device returns the streams are routed back and the pin is intact.
+- **Rules follow the device, not the cable.** PipeWire renumbers Bluetooth
+  profile indices between reconnects, so matching by name alone would read a
+  re-indexed headset as "gone" and drop it to your speakers. Rules therefore
+  match the device itself and survive a re-pair or profile change in either
+  direction; wired outputs are still matched exactly. A device that is present
+  under a different index is not shown as a second, disconnected row.
+- **Names survive power-off.** A disconnected Bluetooth output is still listed
+  by its name (remembered from the last time it was seen) rather than a raw
+  `bluez_output…` id. See *Privacy and data* for what that involves.
+
+## Privacy and data
+
+The plugin is local-only. It makes no network connections, and nothing is sent
+anywhere. It reads `pactl` output and writes exactly two files, both under
+`~/.config/omarchy/`, both created mode `0600`:
+
+| File | Contains | Written by |
+| --- | --- | --- |
+| `router-rules.json` | Your pins: app/binary/node identity and the raw output name each is pinned to | you, by pinning |
+| `petealeon-router.json` | The routing on/off preference, and a cache of **Bluetooth device names and MAC addresses** | the helper, from BlueZ |
+
+`bluetoothctl` is an **optional** dependency used only to turn a MAC address into
+a human-readable device name. If it is not installed the plugin still works: it
+falls back to the name PipeWire reported while the device was connected, and
+then to `Bluetooth AA:BB:CC:DD:EE:FF`. The lookup result is cached (asked once
+per device), and the cache survives disconnects — which is the entire point,
+since the sink is gone from `pactl` exactly when you want to see the name.
+
+Because the state file holds device names and MACs, treat it as identifying
+information: it is `0600`, and `./install.sh --purge` removes it. No other
+identifier, hostname, or telemetry is collected, and the two files are never
+transmitted.
+
+---
+
+The rest of this file is for people building on or debugging the plugin. If you
+only use it, you can stop here.
+
+# For developers
+
+## Component layout
+
+- **Bar widget:** `petealeon.router` (BarWidget.qml + Panel.qml + Model.js)
+- **Watcher/helper:** `assets/omarchy-router` (pure-python, no dependencies
+  beyond `pactl`; `bluetoothctl` optional — see *Requirements*)
+- **Rules store:** `~/.config/omarchy/router-rules.json`
+- **State:** `~/.config/omarchy/petealeon-router.json` (on/off preference and cached
+  Bluetooth device names — see *Privacy and data*)
+
+## How routing is matched
 
 Rules are matched per stream in order of specificity:
 
@@ -184,55 +246,7 @@ To drop a pin, name the app as the panel shows it:
 python3 assets/omarchy-router remove cliamp
 ```
 
-## Bluetooth / device fallback
-
-When a pinned device disconnects (e.g. a Bluetooth headset powers off), the
-next poll moves matching streams to the *system default* instead of leaving them
-muted on the vanished device — and keeps the rule. When the device returns, the
-watcher routes the streams back and logs one `rules reasserted (n)` line.
-
-A Bluetooth rule is matched by **device, not by sink name**. PipeWire suffixes
-Bluetooth outputs with a profile index that is not stable: a headset that comes
-back as profile 2 rather than profile 1 exposes the same speaker under
-`bluez_output.<mac>.2` instead of `.1`. Matching on the name alone reads that as
-"the device vanished" and drops the app to your laptop's speakers, so rules match
-on the MAC instead and survive a re-index in either direction. A rule naming a
-wired output is still matched exactly. The panel does not draw a second,
-"disconnected" row for a device that is present under another index.
-
-Disconnected Bluetooth outputs are still listed by name, so a powered-off
-headset does not read as `bluez_output.24_06_11_A5_E7_95.1`. The name is
-remembered from the last time it was seen; see *Data and privacy* below for what
-that involves.
-
-Watcher log: `$XDG_RUNTIME_DIR/omarchy-router.watch.log` (plus one previous
-generation, `.1`; both are capped at 256 KB — see *Watcher behavior*).
-
-## Data and privacy
-
-The plugin is local-only. It makes no network connections, and nothing is sent
-anywhere. It reads `pactl` output and writes exactly two files, both under
-`~/.config/omarchy/`, both created mode `0600`:
-
-| File | Contains | Written by |
-| --- | --- | --- |
-| `router-rules.json` | Your pins: app/binary/node identity and the raw output name each is pinned to | you, by pinning |
-| `petealeon-router.json` | The routing on/off preference, and a cache of **Bluetooth device names and MAC addresses** | the helper, from BlueZ |
-
-`bluetoothctl` is an **optional** dependency used only to turn a MAC address into
-a human-readable device name. If it is not installed the plugin still works: it
-falls back to the name PipeWire reported while the device was connected, and
-then to `Bluetooth AA:BB:CC:DD:EE:FF`. The lookup result is cached, so it is
-asked once per device rather than once per poll, and the cache survives
-disconnects — which is the entire point, since the sink is gone from `pactl`
-exactly when you want to see the name.
-
-Because the state file holds device names and MACs, treat it as identifying
-information: it is `0600`, and `./install.sh --purge` removes it. No other
-identifier, hostname, or telemetry is collected, and the two files are never
-transmitted.
-
-## Watcher behavior
+## Watcher behaviour
 
 - Polls every 0.5s while audio is playing and backs off to 2.5s when the session
   is silent, applying rules either way and exiting when its spawning parent is
@@ -266,7 +280,6 @@ transmitted.
   lock (bounded, so a just-stopped watcher finishes first) and moves every
   valid stream to `pactl get-default-sink`. Rules are never modified, so
   switching routing back on re-pins the same apps.
-
 
 ## CLI
 

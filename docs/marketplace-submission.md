@@ -1,10 +1,12 @@
 # Marketplace submission — petealeon.router
 
-Draft for the Omarchy plugin marketplace (plugins.omarchy.org). Paste into the
-[submit form](https://plugins.omarchy.org/publish).
+Submitted on **2026-09-29** as
+[omacom/omarchy-plugin-marketplace#9263](https://github.com/omacom/omarchy-plugin-marketplace/issues/9263)
+(v1.4.3, commit `672137a`). Awaiting automated validation of the tagged commit
+and a maintainer's approval.
 
-Status: **not submitted yet.** This file is the only place that says so — the
-README deliberately says nothing about marketplace status, so a reader's first
+Status: **submitted, not yet listed.** This file is the only place that says so —
+the README deliberately says nothing about marketplace status, so a reader's first
 impression of the plugin is the plugin rather than its distribution. Nothing in
 this repository claims the plugin is listed.
 
@@ -26,11 +28,12 @@ this repository claims the plugin is listed.
 ## Suggested listing
 
 **Repository URL:** https://github.com/petealeon/audio-router
-Paste it into the [submit form](https://plugins.omarchy.org/publish).
+As submitted in [#9263](https://github.com/omacom/omarchy-plugin-marketplace/issues/9263).
 
-**Category:** Sound & Audio
+**Category:** Widgets
 
-**Tags:** `audio`, `pipewire`, `routing`, `bluetooth`, `patchbay`
+**Tags:** `Bar`, `Quickshell`, `Media` (the submit form's fixed options; no
+audio tag exists yet — **"Audio"** was suggested, reviewers decide on it)
 
 **Name:** Audio Router
 

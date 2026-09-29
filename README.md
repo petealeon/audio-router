@@ -57,9 +57,9 @@ bar's panel hotkey — see *Keyboard*.
 - **Route:** drag an app row onto an output column.
 - **Reset to default:** drag onto the current default output row or click the
   ring beside the app's name.
-- **Live sources:** a speaker glyph on the left of a row means that source is
-  playing right now (accent when it is pinned, plain when it is just on the
-  system default).
+- **Live sources:** a source with an active stream draws its circle and name
+  at full weight; idle apps are dimmed. The circle/ring stays the pin signal —
+  accent when the app is routed to one of your outputs.
 - **Where things are:** a source's circle sits directly after its name rather
   than at a fixed spot down the column, so a short name keeps its circle next to
   it. An output name is shown in full over two lines instead of being cut short —
@@ -74,11 +74,11 @@ bar's panel hotkey — see *Keyboard*.
   already on the default" is what off means.
 
 Every PipeWire client is listed, whether or not it is playing right now — the
-left column is a stable set you can pre-pin, not a live activity feed. A
-speaker glyph marks the ones that are playing. System services (quickshell,
-wireplumber, pipewire, the portals, EasyEffects) are never listed and never
-steered, so there is nothing to pre-pin *of those* and nothing that can be
-dragged by accident.
+left column is a stable set you can pre-pin, not a live activity feed; rows
+with an active stream draw at full weight, idle ones are dimmed. System
+services (quickshell, wireplumber, pipewire, the portals, EasyEffects) are
+never listed and never steered, so there is nothing to pre-pin *of those* and
+nothing that can be dragged by accident.
 
 ## Keyboard
 
@@ -96,6 +96,24 @@ Once open the panel is fully drivable without a mouse. The first arrow press onl
 wakes the cursor — it does not move or scroll, so the panel never jumps on a
 stray keypress.
 
+### Quick routing
+
+Routing straight from the keyboard is a two-step pick, and every row shows its
+shortcut on the badge: an app row carries a letter, an output row a number
+(`1`–`9`, then leftover letters for outputs past #9).
+
+1. Press the **letter** of the app you want to route — it highlights and stays
+   selected.
+2. Press the **number** (or letter) of the output to send it there.
+
+There is no modifier and no mode to arm: the badges are always visible, a letter
+means either a source *or* an output (never both, because sources claim the
+alphabet first), and you can chain as many routes as you like —
+`a` `1` `b` `1` `c` `2` — before closing.
+
+Routing on/off is `r`, matching the mnemonic-letter convention the built-in
+Bluetooth (`b`), Wi-Fi (`w`) and Tailscale (`t`) panels use.
+
 | Key | Action |
 | --- | --- |
 | `j` / `Down`, `k` / `Up` | Move the cursor a row. From the first app row, up enters the header; from the header, down returns to the app list |
@@ -103,18 +121,15 @@ stray keypress.
 | `h` / `Left` | Back to the app row from the output column |
 | `Return` / `Space` | On the header: toggle routing. On an output: route the app to it |
 | `x` | Reset the app to the system default (same as clicking its ring) |
-| `1`–`9` | Route the app under the cursor to the nth output without walking the column. From the header it applies to the last app the cursor was on, or the first app if it was never in the list |
+| `a`–`z` | Select the app with that badge — quick routing's first step. Letters `j k h l x` (movement/delete) and `r` (routing) are reserved, so no row bears them |
+| `1`–`9` | Route the selected app to that output — quick routing's second step. With no app picked first it uses the app under the cursor (from the header, the last app it sat on); an output's letter badge works the same as its number |
+| `r` | Toggle routing on/off, from anywhere in the panel |
 | `Tab`, `Shift+Tab` | Next / previous panel |
 | `Escape` | Close |
 
 The cursor spans both columns, so moving right lands on the output the app is
-currently on and left comes back to where it was. The columns are *not*
-row-aligned — an output name takes two lines where a source name takes one — so
-the cursor keeps a position per column rather than one shared row number.
-Highlighting is the same one the mouse uses, and hovering the routing switch with
-the mouse focuses it too. The cursor is tracked by app and output key rather than
-by row number, so it survives the 1s refresh — including an app whose stream stops
-mid-navigation.
+currently on and left comes back to where it was. Both columns' rows share one
+height, so a source and the output beside it stay on the same line.
 
 ## Rule matching
 

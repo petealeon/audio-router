@@ -196,11 +196,28 @@ Panel {
   readonly property color userRouteColor: Color.accent
   readonly property color standardRouteColor: Color.foreground
 
+  // Row highlight fills for the patchbay grid, derived from the theme's accent
+  // (not literally "accent" the property, which is a string): a wash of the
+  // routing color reads as "this row is live" on both dark and light themes.
+  // Hover/cursor and armed-selection are two tiers so a clicked-but-not-dragged
+  // source stays visibly selected without looking identical to a sleeping row.
+  // borderSpec is resolved per-state by ThemeSurface/BorderSurface; for the
+  // plain rounded Rectangle here, the selected border is an accent hairline.
+  readonly property color rowHoverFill: root.bar
+    ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.22)
+    : "transparent"
+  readonly property color rowSelectedFill: root.bar
+    ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.38)
+    : "transparent"
+  readonly property color rowSelectedBorder: root.bar
+    ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.8)
+    : "transparent"
+
   function lineColor(style) {
     if (style === "pinned" || style === "ghost" || style === "pending" || style === "stored") return root.userRouteColor
     return root.standardRouteColor
   }
-  readonly property int rowH: Style.spacing.popupRowHeight
+  readonly property int rowH: Style.space(32)
   readonly property int rowGap: Style.space(4)
   readonly property int rowStep: root.rowH + root.rowGap
   readonly property int minLabelW: Style.space(80)
@@ -220,7 +237,7 @@ Panel {
   // characters at the default monospace 12px.
   readonly property int appLabelMaxW: Math.max(
     root.minLabelW,
-    appCol.width - (root.appDotX + root.speakerGutter) - root.dotGap - root.dotRingR - root.dotRightPad
+    appCol.width - (root.appDotX + root.labelPad) - root.dotGap - root.dotRingR - root.dotRightPad
   )
   // Output labels wrap to two lines instead of ellipsizing, because the tail of
   // an output name carries the part that matters ("Analog Stereo" says what the
@@ -228,12 +245,20 @@ Panel {
   // characters a line, so 40 in all: the longest name seen on this machine,
   // "ThinkPad Dock USB Audio Analog Stereo", fits without truncation.
   readonly property int outColW: Style.space(210)
-  readonly property int outRowH: Style.space(32)
+  // The patch grid shares one row height across both columns. Earlier builds
+  // sized the app column from the theme's popup-row-height token (28px) and the
+  // output rows at 32px, so the two dot lanes diverged by 4px per row and a
+  // source routed to the output beside it sloped downhill instead of running
+  // level. Output names wrap to two lines, which sets the floor: 32px fits two
+  // ~14px lines while 28px would clip the second one. outRowH is derived from
+  // root.rowH rather than restated so the two can never drift apart again.
+  readonly property int outRowH: root.rowH
   readonly property int outRowStep: root.outRowH + root.rowGap
-  // Gutter reserved left of every source label for the "is outputting" speaker
-  // glyph. Reserved on every row (not only the ones with a stream) so the
-  // labels stay in a single aligned column.
-  readonly property int speakerGutter: Style.space(18)
+  // Pad left of every source label. It once held the "is outputting" speaker
+  // glyph; the glyph is gone (the row's own circle already signals playback), but
+  // the pad stays so labels line up in one column and the shortcut keycap has a
+  // clear slot beside them.
+  readonly property int labelPad: Style.space(18)
 
   // Where each row put its circle, published by the delegate that draws it. The
   // patch lines, the ring's click target and the drag ghost all read it back
@@ -317,7 +342,7 @@ Panel {
   }
 
   function appDotXForWidth(advanceWidth) {
-    return root.appDotX + root.speakerGutter
+    return root.appDotX + root.labelPad
       + Math.min(advanceWidth, root.appLabelMaxW)
       + root.dotGap
   }
@@ -340,12 +365,12 @@ Panel {
   property string hoverAppKey: ""
   property string hoverTarget: ""
 
-  // Keyboard cursor. appCol and outCol each have their own row grid: the app
-  // rows are one line tall, the output rows two (their names wrap rather than
-  // ellipsize, because an output name's tail is the part that matters). Both
-  // grids start at the same y, and cursorRow is an index into whichever one the
-  // cursor is currently in -- so the two are not the same screen row, and
-  // anything that maps a row to a y has to ask which column it is in.
+  // Keyboard cursor. appCol and outCol share one row grid: both columns' rows
+  // are root.outRowH tall, so row i of each column starts at the same y and the
+  // source circle and output dot of a same-level pair sit on the same line.
+  // cursorRow is still an index into whichever grid the cursor is in, and
+  // anything that maps a row to a y has to ask which column it refers to, but
+  // the two columns no longer resize independently.
   // "header" is a virtual section above row 0 holding the routing switch.
   // The cursor is keyed rather than purely indexed because rows come and go
   // under it: buildRows() re-sorts appRows whenever a stream appears, stops
@@ -356,6 +381,16 @@ Panel {
   property int cursorRow: 0
   property string appCursorKey: ""
   property string outCursorKey: ""
+
+  // Shortcut badges. Every row gets a single meaning to one key, so the badge
+  // always shows exactly what pressing it does. Sources take letters first, in
+  // row order; outputs 1-9 take digits; outputs 10+ take whatever letters the
+  // sources left over. j/k/h/l/x never reach onTextKey (the shell's key
+  // catcher owns them for movement and delete), and r is reserved for the
+  // routing on/off toggle, so none of those may be handed out as a badge.
+  readonly property string reservedShortcuts: "jkhlxr"
+  property var shortcutLetters: []
+  property var shortcutTail: []
   readonly property bool headerHasCursor: root.cursorActive && root.cursorSection === "header"
   readonly property int cursorRowCount: Math.max(root.appRows.length, root.outputRows.length)
   property var _clientCount: {}
@@ -696,6 +731,7 @@ Panel {
 
     root.pinnedCount = 0
     for (i = 0; i < order.length; ++i) if (order[i].rule) root.pinnedCount++
+    root.buildShortcutLayers()
   }
 
   function rowForKey(key) {
@@ -912,6 +948,96 @@ Panel {
     root.commitLink(row.key, root.outputRows[n - 1].key)
   }
 
+  // Allocate the shortcut letters for the current row model: the sources take
+  // the first letters (in display order), the tail of the alphabet is what the
+  // outputs past #9 get to pick from. Called from buildRows so the badges track
+  // every re-sort.
+  function buildShortcutLayers() {
+    var used = {}
+    var i
+    for (i = 0; i < root.reservedShortcuts.length; ++i) used[root.reservedShortcuts.charAt(i)] = 1
+    var letters = []
+    var pool = "abcdefghijklmnopqrstuvwxyz"
+    for (i = 0; i < pool.length; ++i) {
+      var ch = pool.charAt(i)
+      if (!used[ch]) letters.push(ch)
+    }
+    var slots = []
+    for (i = 0; i < root.appRows.length; ++i) slots.push(i < letters.length ? letters[i] : "")
+    var tail = []
+    for (i = slots.length; i < letters.length; ++i) tail.push(letters[i])
+    root.shortcutLetters = slots
+    root.shortcutTail = tail
+  }
+
+  function sourceBadge(idx) {
+    if (idx >= 0 && idx < root.shortcutLetters.length) return root.shortcutLetters[idx]
+    return ""
+  }
+
+  function outputBadge(idx) {
+    if (idx >= 0 && idx < 9) return String(idx + 1)
+    var t = idx - 9
+    if (t >= 0 && t < root.shortcutTail.length) return root.shortcutTail[t]
+    return ""
+  }
+
+  // The keycap background behind a shortcut letter. A wash of textColor with an
+  // explicit alpha, not a sibling Text dimmed by container opacity -- alpha kept
+  // on the fill keeps the letter itself independent of the box. The hot state
+  // (row selected / hovered) raises the fill so the badge reads as armed.
+  function badgeFill(hot) {
+    return Qt.rgba(root.textColor.r, root.textColor.g, root.textColor.b, hot ? 0.32 : 0.18)
+  }
+
+  // 'a'..'z' lands the keyboard cursor on the matching source row and leaves it
+  // armed (selectKey) so a following 1-9 routes that source. currentAppRow()
+  // reads appCursorKey, so the subject survives even after the mouse steals the
+  // highlight. Rows past the alphabet have no letter and cannot be chosen this
+  // way -- buildRows still sorts them in, and digits/drag reach them. Returns
+  // true when the letter named a source.
+  function selectSourceByLetter(letter) {
+    var want = String(letter).toLowerCase()
+    if (want.length !== 1) return false
+    var i
+    for (i = 0; i < root.shortcutLetters.length; ++i) {
+      if (root.shortcutLetters[i] === want) {
+        root.cursorActive = true
+        root.cursorSection = "apps"
+        root.cursorRow = i
+        root.appCursorKey = root.appRows[i].key
+        root.selectKey = root.appRows[i].key
+        root.syncCursorRow()
+        root.ensureCursorVisible()
+        root.logEvent("shortcut select " + want.toUpperCase() + " -> " + root.appRows[i].label)
+        return true
+      }
+    }
+    return false
+  }
+
+  // Outputs past #9 carry letter badges instead of digits (the alphabet tail the
+  // sources did not use). Pressing one routes the current source there, exactly
+  // as a digit would. Sources get first pick of the letters, so a letter can
+  // never mean both a source and an output. Mirrors quickRouteCursor.
+  function routeByOutputLetter(letter) {
+    var want = String(letter).toLowerCase()
+    if (want.length !== 1) return false
+    var t
+    for (t = 0; t < root.shortcutTail.length; ++t) {
+      if (root.shortcutTail[t] === want) {
+        var n = t + 10
+        if (root.outputRows.length < n) return false
+        var row = root.currentAppRow()
+        if (!row) return false
+        root.commitLink(row.key, root.outputRows[n - 1].key)
+        root.syncCursorRow()
+        return true
+      }
+    }
+    return false
+  }
+
   // The built-in panels keep the focused row inside the viewport; without this
   // j/k can walk the cursor off-screen. There is no ListView here, so do it
   // against the Flickable directly.
@@ -988,12 +1114,13 @@ Panel {
     var pad = Style.space(12)
     if (outputRepeater.count === 0) return null
     if (x < outCol.x - pad || x > outCol.x + outCol.width + pad) return null
-    // outRowStep, not rowStep: the two columns' rows are independently sized,
-    // and outputAt above divides the same y by outRowStep. Using rowStep here
-    // meant a snap drop landing outside the real row — or short of the last one
-    // — whenever the source rows happened to be taller or shorter than the
-    // output rows, so the drag snapped to the wrong output. Which row is hit
-    // must not depend on how tall the other column is.
+    // outRowStep, not rowStep: despite sharing one row height, index ranges
+    // over the two columns still belong to their own grids, and outputAt above
+    // divides the same y by outRowStep. Using rowStep here meant a snap drop
+    // landing outside the real row — or short of the last one — whenever the
+    // source rows happened to be taller or shorter than the output rows, so
+    // the drag snapped to the wrong output. Which row is hit must not depend
+    // on how tall the other column is.
     if (y < 0 || y >= root.outputRows.length * root.outRowStep) return null
     var idx = Math.floor(y / root.outRowStep)
     if (idx >= root.outputRows.length) return null
@@ -1256,6 +1383,17 @@ Panel {
           if (!root.cursorActive) { root.cursorActive = true; root.syncCursorRow() }
           root.quickRouteCursor(t)
           root.syncCursorRow()
+          return
+        }
+        if (t === "r" || t === "R") {
+          root.toggleRoutingFromCursor()
+          return
+        }
+        if (/^[a-zA-Z]$/.test(t)) {
+          if (!root.cursorActive) { root.cursorActive = true; root.syncCursorRow() }
+          // Sources claim letters first; any letter the sources did not take
+          // belongs to an output past #9 and routes there instead.
+          if (!root.selectSourceByLetter(t)) root.routeByOutputLetter(t)
         }
       }
     }
@@ -1278,7 +1416,7 @@ Panel {
         id: hero
         width: parent.width
         title: "Audio Router"
-        meta: "drag app → output\nclick the ring to unlink"
+        meta: "drag app → output\nclick the ring to unlink\na–z source · 1–9 route · r on/off"
         foreground: root.textColor
         fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
         iconOpacity: root.routingOn ? 1.0 : 0.5
@@ -1373,9 +1511,17 @@ Panel {
                 Rectangle {
                   anchors.fill: parent
                   radius: Style.space(4)
-                  color: (root.hoverAppKey === appDlg.dkey || root.dragKey === appDlg.dkey)
-                    ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.10)
-                    : "transparent"
+                  // Two tiers so a plain click that arms click-to-click
+                  // (selectKey) stays visibly selected instead of blinking off
+                  // with the cursor. Built from the theme accent, not the bare
+                  // string property — accent.r was once read off "accent",
+                  // which is typed string, so every .r/.g/.b was undefined and
+                  // the wash degraded to transparent black on every theme.
+                  color: (root.dragKey === appDlg.dkey || root.selectKey === appDlg.dkey)
+                    ? root.rowSelectedFill
+                    : (root.hoverAppKey === appDlg.dkey ? root.rowHoverFill : "transparent")
+                  border.width: (root.dragKey === appDlg.dkey || root.selectKey === appDlg.dkey) ? 1 : 0
+                  border.color: root.rowSelectedBorder
                 }
 
                 Item {
@@ -1384,17 +1530,30 @@ Panel {
                   width: parent.width
                   height: root.rowH
 
-                  // "This source is producing audio right now." Accent when the
-                  // stream is pinned to one of the user's routes, plain
-                  // foreground when it is just on the system default.
-                  Text {
-                    id: appSpeaker
-                    x: root.appDotX
+                  // Shortcut keycap: the letter that selects this row, drawn on a small
+                  // filled square so the hint reads as a key rather than as text
+                  // that belongs to the row. Uppercase to match the meta hint;
+                  // the row itself is chosen case-insensitively. Sits just left
+                  // of the label so its spacing mirrors the output keycaps on
+                  // the far side.
+                  Rectangle {
+                    id: appBadge
+                    x: Style.space(10)
+                    width: Style.space(14)
+                    height: Style.space(14)
+                    radius: Style.space(4)
                     anchors.verticalCenter: parent.verticalCenter
-                    visible: model.streams.length > 0
-                    font.pixelSize: Style.font.caption
-                    color: (model.rule || model.pendingDefault) ? root.userRouteColor : root.textColor
-                    text: "\uF028"
+                    color: root.badgeFill(root.dragKey === appDlg.dkey || root.selectKey === appDlg.dkey || root.hoverAppKey === appDlg.dkey)
+
+                    Text {
+                      anchors.centerIn: parent
+                      horizontalAlignment: Text.AlignHCenter
+                      font.pixelSize: Style.font.caption
+                      font.bold: true
+                      text: root.sourceBadge(model.index).toUpperCase()
+                      color: root.accent
+                      opacity: (root.dragKey === appDlg.dkey || root.selectKey === appDlg.dkey) ? 1.0 : 0.8
+                    }
                   }
 
                   // Not an Item, so it draws nothing and takes no `visible`.
@@ -1409,7 +1568,7 @@ Panel {
 
                   Text {
                     id: appLabel
-                    x: root.appDotX + root.speakerGutter
+                    x: root.appDotX + root.labelPad
                     anchors.verticalCenter: parent.verticalCenter
                     width: root.appLabelMaxW - (model.streams.length > 1 ? Style.space(18) : 0)
                     elide: Text.ElideRight
@@ -1493,9 +1652,17 @@ Panel {
                 Rectangle {
                   anchors.fill: parent
                   radius: Style.space(4)
-                  color: (root.dragging && root.hoverTarget === outDlg.okey)
-                    ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.14)
+                  // Highlights on any hoverTarget, not just while dragging: the
+                  // keyboard cursor parks on an output without a drag (see
+                  // syncCursorRow) and that row must read as selected too. The
+                  // fill tier keeps the drop-target (drag) distinct from a
+                  // mere cursor stop, and the hairline border marks the drop
+                  // target so a hover wash can't be mistaken for armed routing.
+                  color: root.hoverTarget === outDlg.okey
+                    ? (root.dragging ? root.rowSelectedFill : root.rowHoverFill)
                     : "transparent"
+                  border.width: (root.dragging && root.hoverTarget === outDlg.okey) ? 1 : 0
+                  border.color: root.rowSelectedBorder
                 }
 
                 Item {
@@ -1503,11 +1670,39 @@ Panel {
                   width: parent.width
                   height: root.outRowH
 
+                  // Shortcut keycap: the digit (or, past #9, letter) that routes the current
+                  // source here, on the same filled square as the source badges.
+                  // Anchored to the output row's right edge, away from the patch
+                  // lines and the out-dot on the left, so the hint is never
+                  // crossed by a route.
+                  Rectangle {
+                    id: outBadge
+                    anchors.right: parent.right
+                    anchors.rightMargin: Style.space(6)
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: Style.space(14)
+                    height: Style.space(14)
+                    radius: Style.space(4)
+                    color: root.badgeFill(root.hoverTarget === outDlg.okey)
+
+                    Text {
+                      anchors.centerIn: parent
+                      horizontalAlignment: Text.AlignHCenter
+                      font.pixelSize: Style.font.caption
+                      font.bold: true
+                      text: root.outputBadge(model.index).toUpperCase()
+                      color: root.accent
+                      opacity: root.hoverTarget === outDlg.okey ? 1.0 : 0.8
+                    }
+                  }
+
                   Text {
                     id: outLabel
                     x: root.outDotX + Style.space(10)
                     anchors.verticalCenter: parent.verticalCenter
-                    width: outCol.width - (x + Style.space(6)) - (model.offline ? Style.space(34) : 0)
+                    // 6 badge margin + 14 badge width + 6 label gap stops the
+                    // wrapped lines short of the right-hand keycap.
+                    width: outCol.width - (x + Style.space(26)) - (model.offline ? Style.space(34) : 0)
                     // Wrap rather than elide: the tail of an output name is the
                     // informative part, and an ellipsis would replace exactly
                     // that. Two lines of ~20 characters cover every name seen
@@ -1526,7 +1721,9 @@ Panel {
                   Text {
                     visible: model.offline === true
                     anchors.right: parent.right
-                    anchors.rightMargin: Style.space(6)
+                    // Clear the shortcut keycap on the far right: 6 margin + 14
+                    // badge + 6 gap.
+                    anchors.rightMargin: Style.space(26)
                     anchors.verticalCenter: parent.verticalCenter
                     font.pixelSize: Style.font.caption
                     color: root.textColor
@@ -1539,21 +1736,24 @@ Panel {
                     width: 6
                     height: 6
                     radius: 3
-                    // The first line of the label, not the middle of the block.
-                    // A wrapped name reads as line 1 plus line 2, and a leading
-                    // icon belongs to line 1; centred on the block it would sit
-                    // in the gap between the two lines, belonging to neither.
+                    // The middle of the output's line block, not its first line.
+                    // A wrapped name reads as line 1 plus line 2, and the anchor
+                    // for "this is the output this route lands on" is the whole
+                    // block, so the dot belongs halfway between the two lines.
                     //
-                    // outLabel is vertically centred in outRowH, so for a
-                    // one-line name this lands exactly on the row centre -- the
-                    // position the dot had before labels could wrap -- and for a
-                    // two-line name it lands half a line box up, on line 1.
+                    // Centring on the parent Item (the output row's content box)
+                    // splits the difference for one-line names -- the dot stays
+                    // where it has always sat, on the row centre -- and for a
+                    // two-line name it stops riding line 1 half a line box up,
+                    // which made every "straight across" link from a source go
+                    // uphill.
                     //
-                    // 0.6 is half of a single-spaced line box (1.2em). Do not
-                    // reach for outLabel.lineHeight here: under the default
-                    // ProportionalHeight mode it is a multiplier, not pixels, and
-                    // it would silently collapse this offset to half a pixel.
-                    y: outLabel.y + outLabel.font.pixelSize * 0.6 - 3
+                    // anchors.verticalCenter does the division once, so there is
+                    // no offset to drift out of step with a font change. Do not
+                    // reach for outLabel.y here: under the old scheme it shipped
+                    // the row-relative top of the block, and combining it with
+                    // the row height double-counts the offset.
+                    anchors.verticalCenter: parent.verticalCenter
                     x: root.outDotX - 3
                     // Publish the centre, not the left/top edge, so the reader
                     // gets the same point the patch line's endpoint is drawn at.
@@ -1616,8 +1816,19 @@ Panel {
           acceptedButtons: Qt.LeftButton
 
           onPositionChanged: (m) => {
+            // Mirror of rowKeyAt for the output column. hoverAppKey owns the
+            // app side and hoverTarget the output side, so a mouse hover must
+            // light the row under it in whichever column it is in -- the
+            // output highlight previously only appeared while dragging or from
+            // the keyboard cursor (syncCursorRow), never from a bare hover.
             root.hoverAppKey = root.rowKeyAt(m.x, m.y)
+            root.hoverTarget = root.outputAt(m.x, m.y) || ""
             if (root.dragging) root.updateDragAt(m.x, m.y)
+          }
+
+          onExited: {
+            root.hoverAppKey = ""
+            root.hoverTarget = ""
           }
 
           onPressed: (m) => {

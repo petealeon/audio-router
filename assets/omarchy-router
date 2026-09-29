@@ -2497,9 +2497,17 @@ Client #13
         # disagree with it. Three readers: badgeHit, dotCenterFor, the ghost.
         check("the circle's position has one owner and three readers",
               panel_src.count("root.appDotXFor("), 3)
-        # Output rows are two lines tall, so they no longer share the app grid.
-        # Anything that turns an output index into a y has to use the output
-        # step, or it points at the wrong row.
+        # The patch grid shares one row height across both columns. Output rows
+        # are two lines tall and set the 32px floor (rowH and outRowH are the
+        # same property now). Anything that turns an *index* into a y still has
+        # to use the output step, because both columns index their own array --
+        # but the two steps must stay numerically equal, so a same-level source
+        # and output sit on the same line.
+        check("outRowH is derived from rowH, not restated",
+              "readonly property int outRowH: root.rowH" in panel_src, True)
+        check("and both rows come from one 32px source",
+              bool(re.search(r"readonly property int rowH: Style\.space\(32\)", panel_src)),
+              True)
         check("output hit-testing indexes by the output row step",
               bool(re.search(r"Math\.floor\(y\s*/\s*root\.outRowStep\)", qml_fn("outputAt"))),
               True)
@@ -2520,9 +2528,85 @@ Client #13
         check("scrolling the cursor uses the step of the column it is in",
               'root.cursorSection === "outputs" ? root.outRowStep' in qml_fn("ensureCursorVisible"),
               True)
-        # Both columns share one Item, so its height has to be the taller of the
-        # two grids. Sizing it from the app step alone clips the bottom of a
-        # longer output list.
+        # Shortcut badges. Sources take letters a-z first, in row order;
+        # outputs 1-9 take digits; outputs past #9 take the alphabet tail the
+        # sources did not use. j/k/h/l/x never reach the panel (the shell's key
+        # catcher claims them for movement/delete) and r is reserved for the
+        # routing toggle, so no row may be badged with any of those six -- the
+        # badge must show exactly what pressing the key actually does.
+        check("the shared shortcut pool is allocated from the sources upward",
+              "shortcutLetters" in panel_src and "shortcutTail" in panel_src, True)
+        check("sources and outputs may not claim j/k/h/l/x or the routing r",
+              'readonly property string reservedShortcuts: "jkhlxr"' in panel_src, True)
+        # The letter keys feed two functions: a source select (which also arms
+        # selectKey so the chosen row stays visibly picked) and an output-tail
+        # route for outputs past #9. A letter must mean at most one thing --
+        # sources get first pick, so a tail letter can never shadow a source.
+        check("a letter press selects a source and arms it for routing",
+              "root.appCursorKey = root.appRows[i].key" in qml_fn("selectSourceByLetter"), True)
+        check("and marks it selected so the highlight outlives the mouse",
+              "root.selectKey = root.appRows[i].key" in qml_fn("selectSourceByLetter"), True)
+        check("an output past #9 is reached by its leftover letter",
+              "root.shortcutTail[t]" in qml_fn("routeByOutputLetter"), True)
+        # Wiring: r toggles the watcher, letters go source-first then output,
+        # digits keep their existing quick-route meaning. If someone reorders
+        # the catcher so r routes instead of toggling, the first guard here
+        # fails.
+        catcher = qml_block("keyCatcher")
+        check("r toggles routing when the panel is focused",
+              "t === \"r\"" in catcher and "toggleRoutingFromCursor()" in catcher, True)
+        check("a letter press tries the source and falls back to the output",
+              "selectSourceByLetter(t)" in catcher and "routeByOutputLetter(t)" in catcher, True)
+        check("1-9 still quick-route the current source",
+              "root.quickRouteCursor(t)" in catcher, True)
+        # Both row kinds draw a badge chip that reports exactly the key that
+        # reaches them, so the label and the handler can never drift apart.
+        check("source rows render their shortcut letter",
+              "root.sourceBadge(model.index)" in panel_src, True)
+        check("output rows render their shortcut number or letter",
+              "root.outputBadge(model.index)" in panel_src, True)
+        # Following the shortcut means following the keyboard cursor, so the
+        # badge letter for a source has to line up with the row the letter
+        # handler lands on (same index, same appRows array).
+        check("every source row that gets a letter is selectable by it",
+              "root.shortcutLetters.length" in qml_fn("selectSourceByLetter"), True)
+        # The badges are keycaps: a letter/number on a filled square, so the hint
+        # reads as a key instead of as text that belongs to the row. Alpha lives
+        # on the fill (badgeFill), not on a container opacity, or the letter
+        # would dim with the box -- and the row fills use the same trick, so a
+        # container-opacity fade would diverge from the rest of the panel.
+        app_badge = qml_block("appBadge")
+        out_badge = qml_block("outBadge")
+        check("a shortcut hint is drawn on a filled keycap",
+              "radius: Style.space(4)" in app_badge and "radius: Style.space(4)" in out_badge, True)
+        check("and the keycap fill keeps an explicit alpha on the fill",
+              "root.badgeFill(" in app_badge and "root.badgeFill(" in out_badge, True)
+        check("the keycap letter stays centered and accent-coloured",
+              "anchors.centerIn: parent" in app_badge and "anchors.centerIn: parent" in out_badge, True)
+        # Geometry: the source keycap sits just left of the label with the same
+        # label gap as the output keycap on the far side (both 6px), and the
+        # output keycap is pinned to the row's right edge, clear of the patch
+        # lines and the out-dot on the left.
+        check("the source keycap matches the output keycap's spacing",
+              "x: Style.space(10)" in app_badge and "width: Style.space(14)" in app_badge, True)
+        check("the output keycap anchors to the right of the row",
+              "anchors.right: parent.right" in out_badge and "anchors.rightMargin: Style.space(6)" in out_badge
+              and "width: Style.space(14)" in out_badge, True)
+        # The output label reserves the badge's width so a wrapped name never
+        # slides under the right-hand keycap.
+        check("the output label stops short of the keycap",
+              "Style.space(26)" in qml_block("outLabel"), True)
+        # The speaker glyph is gone: the row's own circle already signals an
+        # active stream (bolder dot, full-weight name), and the icon used to
+        # crowd the shortcut keycap's slot. Keep it gone -- the label pad it
+        # once shared is now just that, a label pad.
+        check("the speaker glyph stays gone from the source rows",
+              "appSpeaker" not in panel_src, True)
+        check("and the old gutter was renamed to a plain label pad",
+              "speakerGutter" not in panel_src and "readonly property int labelPad" in panel_src, True)
+        # Both columns share one Item, so its height covers whichever grid runs
+        # longer. Sizing it from the app step alone clips the bottom of a longer
+        # output list.
         check("the patch area is tall enough for the taller output rows",
               "root.outputRows.length * root.outRowStep" in qml_block("patchArea"), True)
         # Output names wrap rather than ellipsize, because an output name's tail
@@ -2535,21 +2619,26 @@ Client #13
               "wrapMode: Text.WordWrap" in out_label, True)
         check("and keep a two-line floor so a long name cannot overflow",
               re.findall(r"maximumLineCount:\s*(\d+)", out_label), ["2"])
-        # The output dot is anchored to the label's first line, so a wrapped
-        # name's icon belongs to line 1 rather than floating in the gap between
-        # the lines. Scoped to the dot's own block, and the row height is banned
-        # there outright: outLabel.y is already row-relative, so combining it
-        # with outRowH double-counts the offset and lifts the dot out of its row.
+        # The output dot is vertically centred in the output row's content box.
+        # A wrapped name reads as line 1 plus line 2, and the anchor for "the
+        # route lands on this output" is the whole block, not its first line:
+        # riding line 1 put the dot half a line box above the row middle, which
+        # made every "straight across" link from a source go uphill. Scoped to
+        # the dot's own block, and the row height is banned there outright: an
+        # anchor to the parent's vertical centre already IS the row centre, so
+        # adding outRowH on top would double-count the offset.
         out_dot = qml_block("outDot")
-        check("the output dot is anchored to the label's first line",
-              "outLabel.y" in out_dot, True)
-        check("and never mixes in the row height on top of it",
+        check("the output dot is vertically centred in its row",
+              "anchors.verticalCenter: parent.verticalCenter" in out_dot, True)
+        check("and never re-reads the label's lines to position itself",
+              "outLabel" in out_dot, False)
+        check("and never mixes in the row height on top of the centring",
               "outRowH" in out_dot, False)
         # lineHeight is a multiplier under the default ProportionalHeight mode,
-        # not pixels, so reaching for it here collapses the offset to 0.5px and
-        # silently drops the dot onto the block's top edge.
-        check("the output dot's line offset is read in pixels, not as a multiplier",
-              "lineHeight" in out_dot, False)
+        # not pixels, so reaching for it here is guesswork either way. The old
+        # formula derived the offset from the font size; the anchor does not.
+        check("the output dot's position does not depend on the font size",
+              "font.pixelSize" in out_dot, False)
         # One owner, one reader. The patch canvas draws its endpoint behind the
         # columns, so a connected output shows one dot only while the passive dot
         # and the line endpoint occupy the same pixel. A reader that recomputes
@@ -2559,17 +2648,6 @@ Client #13
               "root.outDotCenterY(" in qml_fn("dotCenterFor"), True)
         check("the output dot's position has one owner and three readers",
               panel_src.count("root._outDotY["), 3)
-        # The offset has to be a fraction of the font size, not a pixel count:
-        # a hardcoded pixel offset does not follow the font scale, so the dot
-        # lands off line 1 as soon as the user changes it. The accepted range is
-        # half a line box for line spacings of 1.0em to 1.6em, which is where
-        # "aligned to the first line" stops meaning anything else. The exact
-        # value is a design choice, not a contract, so it is not pinned.
-        m_off = re.search(r"outLabel\.font\.pixelSize\s*\*\s*([0-9.]+)", out_dot)
-        check("the output dot's offset scales with the font rather than a pixel count",
-              bool(m_off), True)
-        check("and that fraction still means half a line box",
-              m_off is not None and 0.4 <= float(m_off.group(1)) <= 0.8, True)
         # Everything above is pointless if the published number is the dot's top
         # edge instead of its centre: the canvas then draws its endpoint 3px
         # above the passive dot, which is the same split the alignment fixes,
@@ -2578,10 +2656,13 @@ Client #13
               [len(re.findall(r"noteOutDotY\(\s*\w+\.okey\s*,\s*outDot\.y\s*\+\s*3\s*\)", panel_src)),
                len(re.findall(r"noteOutDotY\(\s*\w+\.okey\s*,\s*y\s*\+\s*3\s*\)", panel_src))],
               [1, 1])
-        # A label re-wraps without the row changing shape (theme or font-scale
-        # change, an output coming back online), so the position has to be
+        # The dot's y used to depend on the label's lines, so a re-wrap moved it and
+        # the published position had to follow. With vertical centring the dot
+        # rides the row geometry instead, but the row geometry itself can still
+        # change (theme or font-scale change to outRowH), and _outDotY is the
+        # only source the canvas reads -- so the position still has to be
         # republished on a y change and not only when the delegate is built.
-        check("the output dot republishes when the label re-wraps",
+        check("the output dot republishes on any y change",
               "onYChanged: root.noteOutDotY(" in out_dot, True)
         # _outDotY is mutated in place, so the Canvas's dependency on it never
         # fires. Without an explicit repaint the line keeps pointing where the
@@ -2602,6 +2683,54 @@ Client #13
         check("the repaint coalesces a frame's worth of rows",
               bool(re.search(r"if\s*\(\s*root\._repaintQueued\s*\)\s*return", qml_fn("repaintPatch"))),
               True)
+        # Row highlights. The fills are washes of the theme accent, read off a
+        # real color (Color.accent), not the string-typed `accent` property:
+        # .r/.g/.b on a JS string are all undefined, so the old Qt.rgba call
+        # collapsed to transparent black and the highlight was invisible on
+        # every theme. Guards below pin both halves: the sources feed the
+        # two-tier fills, and no row may read the bare string's channels.
+        check("row highlights are washes of the theme accent, not a string",
+              "Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b" in panel_src, True)
+        check("and the filled rows never read the string-typed accent channels",
+              "Qt.rgba(root.accent.r" in panel_src, False)
+        check("hover/cursor and selected rows use distinct tiers",
+              "root.rowHoverFill" in panel_src and "root.rowSelectedFill" in panel_src, True)
+        # A plain click arms click-to-click selection (selectKey) without a drag.
+        # selectKey used to have no visual at all, so a chosen source vanished
+        # the moment the cursor left it. It has to join the drag source in the
+        # selected tier, and the selected tier carries an accent hairline so a
+        # wash alone cannot be mistaken for a sleeping row on low-contrast
+        # themes. Playing both sides of the two-tier ternary guards the tier
+        # split itself -- if someone collapses it back to a single fill, the
+        # border's grouping key will not match the fill's.
+        app_row = qml_block("appDlg")
+        check("the armed source joins the drag source in the selected tier",
+              "root.selectKey === appDlg.dkey" in app_row, True)
+        check("and the selected tier gets an accent hairline",
+              "border.width: (root.dragKey === appDlg.dkey || root.selectKey === appDlg.dkey) ? 1 : 0" in app_row, True)
+        check("while plain hover or cursor stays on the lighter wash",
+              "root.hoverAppKey === appDlg.dkey ? root.rowHoverFill" in app_row, True)
+        # The keyboard cursor parks on an output without any drag: syncCursorRow
+        # sets hoverTarget for the outputs section. Gating the highlight on
+        # `dragging` hid that row entirely, so a keyboard-selected output looked
+        # exactly like every other idle row.
+        out_row = qml_block("outDlg")
+        check("an output row highlights for any hoverTarget, drag or cursor",
+              "color: root.hoverTarget === outDlg.okey" in out_row, True)
+        check("and only a live drag earns the stronger tier and the hairline",
+              "root.dragging ? root.rowSelectedFill" in out_row, True)
+        # A bare mouse hover over an output used to refresh only hoverAppKey
+        # (the app column's key), so the output column stayed dark until a drag
+        # or the keyboard cursor parked there. The hover handler must publish
+        # the output list's key on position change too, and clear both hover
+        # keys when the cursor leaves the patch, or a highlight sticks for good.
+        p_mouse = qml_block("patchMouse")
+        check("mouse hover over the output column sets hoverTarget",
+              "root.hoverTarget = root.outputAt(m.x, m.y) || \"\"" in p_mouse, True)
+        check("and mouse hover over the app column keeps hoverAppKey",
+              "root.hoverAppKey = root.rowKeyAt(m.x, m.y)" in p_mouse, True)
+        check("and leaving the patch clears both hover keys",
+              "onExited: {" in p_mouse and 'root.hoverAppKey = ""' in p_mouse and 'root.hoverTarget = ""' in p_mouse, True)
     except OSError as ex:
         check("Panel.qml readable for the fold checks", f"unreadable: {ex}", "readable")
 

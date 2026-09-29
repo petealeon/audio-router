@@ -3,6 +3,42 @@
 All notable changes to `petealeon.router` are documented here. SemVer; releases are
 tagged `vX.Y.Z`.
 
+## [1.4.3] - 2026-09-29
+
+Keyboard routing you can see, output rows that follow the mouse, and a README
+written for the person who installs the widget.
+
+### Added
+- **Two-step keyboard routing.** Every row now carries a shortcut badge — a
+  letter on each app row, a number (`1`–`9`, then leftover letters past #9) on
+  each output row — so the shortcuts are always visible and there is no mode to
+  arm. A letter selects the app, a number (or letter) routes it, and routes can
+  be chain-typed one after another. `r` toggles routing on/off from anywhere in
+  the panel, the same mnemonic-letter convention the built-in Bluetooth (`b`),
+  Wi-Fi (`w`) and Tailscale (`t`) panels use; `j k h l x` are reserved for
+  movement and delete, so no row is badged with a key that does something else.
+
+### Fixed
+- **Output rows only highlighted while a drag or the keyboard cursor crossed
+  them.** A plain mouse hover on the output column lit nothing, which made the
+  top output read as the default until you dragged. Output rows now respond to
+  a plain hover exactly like the app rows do.
+
+### Changed
+- **Both columns share one 32px row height.** Output rows had been two lines
+  tall to show full device names, which made a same-level source and output sit
+  on different lines and a snap drag land according to the *other* column's
+  height. One shared height keeps a route exactly level — and the output column
+  still shows full names, it just draws them on the same row.
+- **The playing glyph is gone.** The redundant speaker icon next to the app name
+  — its live/paused signal was already carried by the row's circle and label
+  weight — was removed to make room for the shortcut badge; a row that is
+  actually playing draws at full weight, idle rows are dimmed.
+- **The README was rewritten for end users.** Highlights, install, usage,
+  keyboard, Bluetooth and privacy now lead; rule matching, watcher internals,
+  the CLI and development notes moved behind a clearly separated "For
+  developers" appendix. A screenshot of the panel in action links from the top.
+
 ## [1.4.2] - 2026-09-28
 
 A malformed rule file could silence the whole panel, and a crashed watcher

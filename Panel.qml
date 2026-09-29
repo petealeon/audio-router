@@ -176,7 +176,7 @@ Panel {
 
   // ------------------------------------------------------------------ state
 
-  property string accent: Color.accent
+  property color accent: Color.accent
   readonly property color textColor: root.bar ? root.bar.foreground : Color.popups.text
 
   // Effective watcher state as seen by the header's on/off switch: `on` only
@@ -393,7 +393,7 @@ Panel {
   property var shortcutTail: []
   readonly property bool headerHasCursor: root.cursorActive && root.cursorSection === "header"
   readonly property int cursorRowCount: Math.max(root.appRows.length, root.outputRows.length)
-  property var _clientCount: {}
+  property var _clientCount: ({})
   property bool _hadInputs: false
   property int _emptyStreak: 0
 

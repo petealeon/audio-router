@@ -388,13 +388,40 @@ def preserve_corrupt_store():
         return None
 
 
+def atomic_write(path, text):
+    """Atomically replace `path` with `text` without ever clobbering a file
+    that was not meant to be written.
+
+    A predictable temp path next to the store is a symlink target: if an
+    attacker (or a stale file) sits there, open("w") follows the link and
+    truncates whatever it points at before the replace lands. mkstemp instead
+    creates a fresh name with O_CREAT|O_EXCL in the same directory -- the only
+    path it opens is one it just created -- and the rename below is atomic, so
+    a crash leaves either the old or the new file, never a torn one. The data
+    is fsynced before the rename so a power cut cannot leave the real file
+    replaced by a truncated temp.
+    """
+    directory = os.path.dirname(path)
+    os.makedirs(directory or ".", exist_ok=True)
+    fd, tmp = tempfile.mkstemp(
+        prefix=os.path.basename(path) + ".tmp.", dir=directory or ".")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def write_rules(rules):
-    os.makedirs(os.path.dirname(STORE), exist_ok=True)
-    tmp = STORE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(rules, f, indent=2)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, STORE)
+    atomic_write(STORE, json.dumps(rules, indent=2))
 
 
 def parse_sinks(raw):
@@ -1058,23 +1085,14 @@ def modify_state(mutator):
         after = mutator(dict(before))
         if after == before:
             return True
-        tmp = f"{STATE}.tmp.{os.getpid()}"
         try:
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(after, f, indent=2)
-                f.write("\n")
             # The state file holds the on/off preference and, since v1.3.2, a
             # cache of Bluetooth device names and MACs. That is device
             # identifying information, so it gets the same 0600 the rules store
             # already had; without this it was world-readable on a shared box.
-            os.chmod(tmp, 0o600)
-            os.replace(tmp, STATE)
+            atomic_write(STATE, json.dumps(after, indent=2) + "\n")
         except OSError as ex:
             say(f"state: could not write {STATE}: {ex}")
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
             return False
     return True
 
@@ -2871,6 +2889,49 @@ Client #13
               True)
     finally:
         pass
+
+    # The marketplace security review pinned two file-safety properties, and
+    # they are guarded here because a regression to either is invisible to the
+    # behavioural checks above (the watcher still routes). A predictable temp
+    # path next to the store is a symlink target that open("w") truncates; a
+    # whole-directory rm -rf keyed on a name alone can delete content this
+    # installer never owned.
+    with open(os.path.abspath(__file__), encoding="utf-8") as _f:
+        helper_src = _f.read()
+    # Everything past the selftest's own header is test text (including these
+    # guard lines), so cut it off before searching for the banned shapes.
+    _production = helper_src.split("\ndef selftest(", 1)[0]
+    # A temp that is merely renamed from a fixed name regresses the fix without
+    # failing a single behaviour test, so pin the exclusive-create shape itself.
+    check("store/state temps are created exclusively, never opened in place",
+          ('open(tmp, "w")' not in _production
+           and 'STORE + ".tmp"' not in _production
+           and 'f"{STATE}.tmp.' not in _production), True)
+    check("atomic_write builds its temp with mkstemp (O_EXCL)",
+          "tempfile.mkstemp" in helper_src, True)
+    check("atomic_write fsyncs before the atomic replace",
+          "os.fsync(f.fileno())" in helper_src
+          and "os.replace(tmp, path)" in helper_src, True)
+
+    install_sh = os.path.normpath(os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), os.pardir, "install.sh"))
+    try:
+        with open(install_sh, encoding="utf-8") as _f:
+            isrc = _f.read()
+        # Both deletion sites must refuse to remove a directory whose manifest
+        # does not declare the id it is being cleaned up as. The name alone is
+        # what made install.sh dangerous; a revert would drop these lines while
+        # every behaviour test above still passed.
+        check("install.sh only deletes a manifest-verified legacy dir",
+              "if [[ -d $dest ]] && grep -q" in isrc, True)
+        check("install.sh only deletes a manifest-verified install dir",
+              "elif [[ -d $DEST ]] && grep -q" in isrc, True)
+        _rm = re.findall(r"rm -rf \"\$dest\"|rm -rf \"\$DEST\"", isrc)
+        check("install.sh directory removals are all behind the id check",
+              len(_rm) == 2, True)
+    except OSError as _ex:
+        check("install.sh readable for the deletion guards",
+              f"unreadable: {_ex}", "readable")
 
     failed = [name for name, ok in checks if not ok]
     print(f"selftest: {len(checks) - len(failed)}/{len(checks)} passed")

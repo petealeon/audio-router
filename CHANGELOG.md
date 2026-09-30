@@ -24,6 +24,17 @@ written for the person who installs the widget.
   top output read as the default until you dragged. Output rows now respond to
   a plain hover exactly like the app rows do.
 
+### Security
+- **Marketplace review hardening.** Two file-safety issues found during the
+  listing review are fixed. The rules and state files are now written through
+  an exclusively-created temp file in the same directory, fsynced, then
+  atomically renamed — a predictable temp path can no longer be a pre-placed
+  symlink that `open("w")` truncates. `install.sh` no longer deletes a
+  `peter.router` / `petealeon.router` directory on a name match alone: it first
+  verifies the directory's `manifest.json` declares the matching plugin id, and
+  leaves anything unverified untouched with a note on how to remove it manually.
+  A root `preview.png` was added so the listing has a real preview image.
+
 ### Changed
 - **Both columns share one 32px row height.** Output rows had been two lines
   tall to show full device names, which made a same-level source and output sit

@@ -2,10 +2,11 @@
 
 Submitted on **2026-09-29** as
 [omacom/omarchy-plugin-marketplace#9263](https://github.com/omacom/omarchy-plugin-marketplace/issues/9263)
-(v1.4.3, commit `672137a`). Awaiting automated validation of the tagged commit
-and a maintainer's approval.
+(v1.4.3). Automated validation **passed**; the maintainer's security review
+found two file-safety blockers, which were fixed and the submission re-run for
+a fresh validation + review (see "Review round" below).
 
-Status: **submitted, not yet listed.** This file is the only place that says so —
+Status: **review in progress, not yet listed.** This file is the only place that says so —
 the README deliberately says nothing about marketplace status, so a reader's first
 impression of the plugin is the plugin rather than its distribution. Nothing in
 this repository claims the plugin is listed.
@@ -32,8 +33,9 @@ As submitted in [#9263](https://github.com/omacom/omarchy-plugin-marketplace/iss
 
 **Category:** Widgets
 
-**Tags:** `Bar`, `Quickshell`, `Media` (the submit form's fixed options; no
-audio tag exists yet — **"Audio"** was suggested, reviewers decide on it)
+**Tags:** `bar`, `quickshell`, `media` (lowercase, as submitted; the form's
+fixed options — no audio tag exists yet — **"Audio"** was suggested, reviewers
+decide on it)
 
 **Name:** Audio Router
 
@@ -83,6 +85,31 @@ access. `bluetoothctl` is optional and used only to resolve a MAC to a name.
 Copied from the repository's `manifest.json` — re-check it with
 `python3 scripts/check-manifest.py` if in doubt, since this block is meant to
 be a paste and a paste is only correct if it matches the file.
+
+## Review round (2026-09-29)
+
+Automated validation **passed** (commit `7fb8009`); the security baseline
+posted `review-required` and the maintainer's review found **two file-safety
+blockers**, both fixed:
+
+- `assets/omarchy-router`: `write_rules()` (and the same pattern in
+  `modify_state()`) wrote to a predictable `*.tmp` path with a plain
+  `open("w")`, which follows a pre-placed symlink and truncates its target.
+  Both now write through an exclusively-created `mkstemp` temp file in the same
+  directory (fsynced) and atomically rename over the target; a failed write
+  cleans its temp up.
+- `install.sh`: `drop_legacy` and `remove` deleted the `peter.router` /
+  `petealeon.router` directory on a name match alone. Both now first verify the
+  directory's `manifest.json` declares the matching plugin id, and leave
+  anything unverified untouched with a note on how to remove it manually.
+
+Also added: a root `preview.png` (the validation bot had fallen back to its
+placeholder preview). Both fixes carry selftest source guards, so a regression
+fails `python3 assets/omarchy-router selftest`.
+
+After the fixes, the `v1.4.3` tag was moved onto the fixed tree (no version
+bump — still pre-publication) and the issue was re-edited to re-run validation
+on the new commit; then a maintainer approves and lists it.
 
 ## After submitting
 

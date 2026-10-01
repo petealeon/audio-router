@@ -2918,17 +2918,29 @@ Client #13
     try:
         with open(install_sh, encoding="utf-8") as _f:
             isrc = _f.read()
-        # Both deletion sites must refuse to remove a directory whose manifest
-        # does not declare the id it is being cleaned up as. The name alone is
-        # what made install.sh dangerous; a revert would drop these lines while
-        # every behaviour test above still passed.
-        check("install.sh only deletes a manifest-verified legacy dir",
-              "if [[ -d $dest ]] && grep -q" in isrc, True)
-        check("install.sh only deletes a manifest-verified install dir",
-              "elif [[ -d $DEST ]] && grep -q" in isrc, True)
-        _rm = re.findall(r"rm -rf \"\$dest\"|rm -rf \"\$DEST\"", isrc)
-        check("install.sh directory removals are all behind the id check",
-              len(_rm) == 2, True)
+        # Marketplace security review, round 3. Both blockers in this block were
+        # the legacy-id cleanup, and the fix was to delete that code rather than
+        # make it safer: no superseded id is referenced at all, so install.sh
+        # cannot auto-delete a directory it did not put there.
+        check("install.sh references no legacy plugin id",
+              ("peter.router" not in isrc and "LEGACY_IDS" not in isrc
+               and "drop_legacy" not in isrc), True)
+        # The second blocker was the shell.json bar-layout fallback writing to a
+        # predictable "shell.json.router.tmp.<pid>" through a shell redirect,
+        # which follows a symlink and truncates its target. That was the only
+        # shell-side temp write in the installer; pin its shape so it cannot
+        # come back with any name.
+        check("install.sh has no predictable temp file write",
+              (".tmp.$$" not in isrc and "router.tmp" not in isrc
+               and re.search(r'>\s*"?\$tmp', isrc) is None), True)
+        # What remains must still be an explicit, manifest-verified decision:
+        # one directory removal, only under --remove/--purge, only when the
+        # manifest declares this plugin's id. The other rm -rf prunes our own
+        # ".petealeon.router.bak.*" glob and is not a user-content path.
+        check("install.sh removes only its own manifest-verified dir",
+              (len(re.findall(r'rm -rf "\$DEST"', isrc)) == 1
+               and "elif [[ -d $DEST ]] && grep -q" in isrc
+               and re.search(r'rm -rf "\$DEST"[\s\S]{0,400}?\$\{PLUGIN_ID\}"', isrc) is None), True)
     except OSError as _ex:
         check("install.sh readable for the deletion guards",
               f"unreadable: {_ex}", "readable")

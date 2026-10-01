@@ -42,8 +42,8 @@ Or, from a checkout of this repo:
 ```
 
 `./install.sh` backs up the running install first (keeping the 3 newest
-`.petealeon.router.bak.*` copies) and upgrades the old `peter.router` id
-cleanly. Your rules in `~/.config/omarchy/router-rules.json` are never touched.
+`.petealeon.router.bak.*` copies). Your rules in
+`~/.config/omarchy/router-rules.json` are never touched.
 
 ## Uninstall
 

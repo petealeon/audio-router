@@ -86,11 +86,13 @@ Copied from the repository's `manifest.json` — re-check it with
 `python3 scripts/check-manifest.py` if in doubt, since this block is meant to
 be a paste and a paste is only correct if it matches the file.
 
-## Review round (2026-09-29)
+## Review rounds
 
-Automated validation **passed** (commit `7fb8009`); the security baseline
-posted `review-required` and the maintainer's review found **two file-safety
-blockers**, both fixed:
+### Round 1 (commit `7fb8009`)
+
+Automated validation **passed**; the security baseline posted
+`review-required` and the maintainer's review found **two file-safety
+blockers**:
 
 - `assets/omarchy-router`: `write_rules()` (and the same pattern in
   `modify_state()`) wrote to a predictable `*.tmp` path with a plain
@@ -98,18 +100,41 @@ blockers**, both fixed:
   Both now write through an exclusively-created `mkstemp` temp file in the same
   directory (fsynced) and atomically rename over the target; a failed write
   cleans its temp up.
-- `install.sh`: `drop_legacy` and `remove` deleted the `peter.router` /
-  `petealeon.router` directory on a name match alone. Both now first verify the
-  directory's `manifest.json` declares the matching plugin id, and leave
-  anything unverified untouched with a note on how to remove it manually.
+- `install.sh`: `drop_legacy` and `remove` deleted a plugin directory on a
+  name/path match alone, without verifying it was this plugin's install.
 
 Also added: a root `preview.png` (the validation bot had fallen back to its
-placeholder preview). Both fixes carry selftest source guards, so a regression
-fails `python3 assets/omarchy-router selftest`.
+placeholder preview).
 
-After the fixes, the `v1.4.3` tag was moved onto the fixed tree (no version
-bump — still pre-publication) and the issue was re-edited to re-run validation
-on the new commit; then a maintainer approves and lists it.
+### Round 2 (commit `6ab1487`)
+
+Validation and the security baseline re-ran clean on the fixed commit; the
+maintainer **confirmed the store-write fix** but found **two more blockers**,
+both inside the legacy-id cleanup:
+
+- `install.sh` still removed the whole legacy directory on its manifest id,
+  including user-added or modified files, without a separate cleanup decision.
+- The shell-layout fallback wrote `shell.json` through a predictable
+  `shell.json.router.tmp.<pid>` redirect, following a symlink and truncating
+  its target.
+
+**Resolution: delete the legacy code rather than make it safer.** The
+superseded `peter.router` id existed only to upgrade machines that had
+installed it before v1.3.0; it was never a marketplace listing, so the
+published plugin has no second id to reconcile. Removing `LEGACY_IDS` /
+`drop_legacy` removes both blockers at the source — the installer can no
+longer delete a directory it did not put there, and has no shell-side temp
+write at all. The one remaining `rm -rf` is the explicit `--remove`/`--purge`
+path, still gated on the directory's `manifest.json` declaring
+`petealeon.router`. `install.sh` dropped from 180 to 117 lines.
+
+Each fix carries selftest source guards, so a regression fails
+`python3 assets/omarchy-router selftest`; the guards were verified to fail
+when each pattern is reintroduced.
+
+After each fix round the `v1.4.3` tag was moved onto the fixed tree (no
+version bump — still pre-publication) and the issue was re-edited to re-run
+validation on the new commit; then a maintainer approves and lists it.
 
 ## After submitting
 

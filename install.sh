@@ -18,11 +18,6 @@
 set -euo pipefail
 
 PLUGIN_ID="petealeon.router"
-# The plugin used to be published as peter.router. Its id is also its install
-# directory and its bar entry, so a plain rename would leave the old copy
-# registered and the bar showing the widget twice. Both the install and the
-# remove paths clean these up first.
-LEGACY_IDS=("peter.router")
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGINS_DIR="${HOME}/.config/omarchy/plugins"
 DEST="${PLUGINS_DIR}/${PLUGIN_ID}"
@@ -30,57 +25,6 @@ SHELL_JSON="${HOME}/.config/omarchy/shell.json"
 
 fail() { echo "install.sh: $*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
-
-# Unregister a superseded id: stop its watcher (anchored to that install path so
-# it can never match an unrelated process), drop the plugin, strip its bar entry,
-# then remove any leftover directory. Routing rules
-# (~/.config/omarchy/router-rules.json) and the on/off preference
-# (~/.config/omarchy/petealeon-router.json) are deliberately untouched — only
-# --purge deletes those.
-drop_legacy() {
-  local legacy dest
-  for legacy in "${LEGACY_IDS[@]}"; do
-    dest="${PLUGINS_DIR}/${legacy}"
-    if ! omarchy plugin list 2>/dev/null | grep -q "^${legacy}[[:space:]]" && [[ ! -d $dest ]] &&
-       ! grep -q "\"${legacy}\"" "$SHELL_JSON" 2>/dev/null; then
-      continue
-    fi
-    pkill -f "${dest}/assets/omarchy-router watch" 2>/dev/null || true
-    if omarchy plugin list 2>/dev/null | grep -q "^${legacy}[[:space:]]"; then
-      omarchy plugin remove "$legacy" --yes >/dev/null 2>&1 || true
-    fi
-    # The directory is only removed if it verifies as that plugin's install:
-    # its manifest.json declares the legacy id. A name alone is not identity --
-    # an unrelated or user-modified directory must be left untouched, and
-    # deleting it needs an explicit decision, so skip and say so instead.
-    if [[ -d $dest ]] && grep -q '"id"[[:space:]]*:[[:space:]]*"'"$legacy"'"' \
-        "$dest/manifest.json" 2>/dev/null; then
-      rm -rf "$dest"
-    elif [[ -d $dest ]]; then
-      echo "install.sh: leaving $dest untouched — not a verified $legacy install (manifest.json has no \"$legacy\" id)." >&2
-      echo "install.sh: remove it manually if that is what you intended." >&2
-    fi
-    # Safety net, not the normal path. Observed on omarchy 4.0.3: `omarchy
-    # plugin remove` already drops the bar entry, and this block does not run.
-    # It stays because the plugin is renamed, and a stale entry would show the
-    # widget twice, so it is cheap insurance against a CLI that leaves the
-    # persisted bar layout alone.
-    if [[ -f $SHELL_JSON ]] && command -v jq >/dev/null 2>&1 &&
-       jq -e --arg id "$legacy" '.bar.layout[][]? | select(.id == $id)' "$SHELL_JSON" >/dev/null 2>&1; then
-      local tmp="${SHELL_JSON}.router.tmp.$$"
-      if jq --arg id "$legacy" '
-            .bar.layout |= with_entries(.value |= map(select(.id != $id)))
-          ' "$SHELL_JSON" >"$tmp" 2>/dev/null; then
-        mv "$tmp" "$SHELL_JSON"
-        echo "Removed stale bar entry for $legacy"
-      else
-        rm -f "$tmp"
-        echo "Warning: could not strip the $legacy bar entry from shell.json" >&2
-      fi
-    fi
-    echo "Removed superseded plugin $legacy (routing rules kept)"
-  done
-}
 
 command -v omarchy >/dev/null 2>&1 || fail "omarchy not found — this installer targets Omarchy systems"
 
@@ -93,9 +37,9 @@ remove() {
   pkill -f "${DEST}/assets/omarchy-router watch" 2>/dev/null || true
   if omarchy plugin list 2>/dev/null | grep -qE "^${PLUGIN_ID}[[:space:]]"; then
     omarchy plugin remove "$PLUGIN_ID" --yes || fail "omarchy plugin remove failed"
-  # Same identity check as drop_legacy: never delete a directory just because
-  # it sits at the plugin's path. Only a manifest declaring this plugin's id
-  # counts, and anything else is left for an explicit manual decision.
+  # Never delete a directory just because it sits at the plugin's path: only a
+  # manifest declaring this plugin's id counts, and only behind the explicit
+  # --remove/--purge decision this function exists to serve.
   elif [[ -d $DEST ]] && grep -q '"id"[[:space:]]*:[[:space:]]*"'"$PLUGIN_ID"'"' \
       "$DEST/manifest.json" 2>/dev/null; then
     rm -rf "$DEST"
@@ -112,19 +56,12 @@ remove() {
           "${HOME}/.config/omarchy/petealeon-router.json"
     echo "Purged routing rules and routing state."
   fi
-  # Also clear any superseded id, so removing after the rename is a clean sweep
-  # rather than leaving an orphan behind.
-  drop_legacy
   echo "Removed $PLUGIN_ID."
   exit 0
 }
 
 [[ ${1:-} == "--remove" ]] && remove 0
 [[ ${1:-} == "--purge" ]] && remove 1
-
-# The rename changes the install directory and bar entry, so clear the old id
-# before installing — otherwise the bar ends up with the widget twice.
-drop_legacy
 
 # ---- dependencies -----------------------------------------------------------
 missing=()

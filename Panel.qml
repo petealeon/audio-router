@@ -1426,6 +1426,8 @@ Panel {
             font.family: hero.fontFamily
             font.pixelSize: Style.font.display
             color: root.textColor
+            // Names are text, never markup: see the selftest guard.
+            textFormat: Text.PlainText
             text: root.label
           }
         }
@@ -1466,6 +1468,7 @@ Panel {
         opacity: root.stateError !== "" || root.restoreError !== "" ? 1.0 : 0.6
         horizontalAlignment: Text.AlignHCenter
         wrapMode: Text.WordWrap
+        textFormat: Text.PlainText
         text: root.stateError !== ""
           ? "routing unavailable — " + root.stateError
           : root.restoreError !== ""
@@ -1550,6 +1553,7 @@ Panel {
                       horizontalAlignment: Text.AlignHCenter
                       font.pixelSize: Style.font.caption
                       font.bold: true
+                      textFormat: Text.PlainText
                       text: root.sourceBadge(model.index).toUpperCase()
                       color: root.accent
                       opacity: (root.dragKey === appDlg.dkey || root.selectKey === appDlg.dkey) ? 1.0 : 0.8
@@ -1575,6 +1579,7 @@ Panel {
                     font.pixelSize: Style.font.body
                     color: root.textColor
                     opacity: (model.streams.length === 0 && !model.rule && !model.isPending) ? 0.55 : 1.0
+                    textFormat: Text.PlainText
                     text: model.label
                   }
 
@@ -1586,6 +1591,7 @@ Panel {
                     font.pixelSize: Style.font.caption
                     color: root.textColor
                     opacity: 0.5
+                    textFormat: Text.PlainText
                     text: String(model.streams.length)
                   }
 
@@ -1690,6 +1696,7 @@ Panel {
                       horizontalAlignment: Text.AlignHCenter
                       font.pixelSize: Style.font.caption
                       font.bold: true
+                      textFormat: Text.PlainText
                       text: root.outputBadge(model.index).toUpperCase()
                       color: root.accent
                       opacity: root.hoverTarget === outDlg.okey ? 1.0 : 0.8
@@ -1715,6 +1722,10 @@ Panel {
                     font.pixelSize: Style.font.body
                     color: root.textColor
                     opacity: model.available === false ? 0.35 : 1.0
+                    // The name here can be a bluetooth device's advertised
+                    // name (Panel.qml builds this row from sinkLabels), i.e.
+                    // attacker-controlled: AutoText would fetch an <img src>.
+                    textFormat: Text.PlainText
                     text: model.label
                   }
 
@@ -1728,6 +1739,7 @@ Panel {
                     font.pixelSize: Style.font.caption
                     color: root.textColor
                     opacity: 0.4
+                    textFormat: Text.PlainText
                     text: model.sub || "offline"
                   }
 

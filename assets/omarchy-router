@@ -2412,6 +2412,41 @@ Client #13
         check("Panel.qml labels every row through friendlyLabel",
               panel_src.count("Model.friendlyLabel("), 4)
 
+        # Marketplace security review, round 4. Row labels are attacker-
+        # controlled strings: buildRows() names an offline output from
+        # sinkLabels, which bluetooth_labels() fills with a paired device's
+        # *advertised* name, and names app rows from pactl's application.name.
+        # QML's Text defaults to Text.AutoText, which parses a leading tag as
+        # rich text, so a name like '<img src="http://host/x">' made the panel
+        # issue an HTTP request -- against the plugin's documented no-network
+        # behaviour. The fix is at the render boundary, not the source: names
+        # are text, never markup, so every Text that binds one is pinned to
+        # PlainText and stored verbatim (escaping in the helper would corrupt
+        # both the label and the cached state file).
+        def _text_blocks(src):
+            """Every `Text {` element body, brace-balanced."""
+            for m in re.finditer(r'Text \{', src):
+                depth, i = 1, m.end()
+                while i < len(src) and depth:
+                    if src[i] == "{":
+                        depth += 1
+                    elif src[i] == "}":
+                        depth -= 1
+                    i += 1
+                yield src[m.end():i - 1]
+
+        _labelled = [b for b in _text_blocks(panel_src)
+                     if re.search(r'^\s*text:', b, re.M)]
+        check("Panel.qml renders every label as plain text",
+              [b for b in _labelled
+               if "textFormat: Text.PlainText" not in b], [])
+        # Second half of the same invariant, stated positively: no Text may opt
+        # back into markup, whichever way the default is spelled. Guarding only
+        # the labelled blocks would miss a Text that renders one a line later.
+        check("Panel.qml never opts a Text into markup",
+              re.findall(r'textFormat:\s*Text\.(?:AutoText|RichText|StyledText)',
+                         panel_src), [])
+
         # ---- layout: the circle and the two row grids -----------------------
         # Same reasoning as the fold above: none of this is reachable from node,
         # and each of these is a way the layout can silently regress while every

@@ -128,6 +128,30 @@ write at all. The one remaining `rm -rf` is the explicit `--remove`/`--purge`
 path, still gated on the directory's `manifest.json` declaring
 `petealeon.router`. `install.sh` dropped from 180 to 117 lines.
 
+### Round 3 (commit `1853f62`)
+
+The maintainer confirmed **both installer blockers fixed** and raised one new
+blocker, this time in the panel rather than the installer:
+
+- A paired Bluetooth device's **advertised name** reaches a `Text` that kept
+  QML's default `textFormat: Text.AutoText`. An `<img src="http://…">` in that
+  name made the panel issue an HTTP request — against the documented
+  no-network behaviour (`README.md`, "Private").
+
+**Resolution: fix the render boundary, not the source.** The untrusted path is
+`bluetooth_labels()` (`assets/omarchy-router`) → `sinkLabels` → `buildRows()`
+labels an offline output from it (app rows are named from pactl's
+`application.name`, equally untrusted). Escaping in the helper would corrupt both
+the label and the cached state file, and would still need repeating for every
+other name-bearing site. Every `Text` in `Panel.qml` that binds a label is now
+pinned to `Text.PlainText` and shows the name verbatim.
+
+Two selftest source guards hold it: every `Text` block with a `text:` binding
+must declare `Text.PlainText`, and no `Text` anywhere in `Panel.qml` may name
+`AutoText`/`RichText`/`StyledText`. Both were verified to fail when the pattern
+is reintroduced (reverting the cited line, flipping one block back to
+`AutoText`, and stripping every `textFormat`).
+
 Each fix carries selftest source guards, so a regression fails
 `python3 assets/omarchy-router selftest`; the guards were verified to fail
 when each pattern is reintroduced.

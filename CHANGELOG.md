@@ -36,8 +36,16 @@ written for the person who installs the widget.
   redirect that followed symlinks. Both were removed rather than made safer, so
   the only directory the installer deletes is its own — behind the explicit
   `--remove`/`--purge` decision, and only when the directory's `manifest.json`
-  declares `petealeon.router`. A root `preview.png` was added so the listing has
-  a real preview image.
+  declares `petealeon.router`.
+- **Device and application names are rendered as plain text.** A row name is not
+  trustworthy: an offline output is named from `sinkLabels`, which holds a
+  paired Bluetooth device's *advertised* name, and an app row is named from
+  pactl's `application.name`. QML's `Text` defaults to `Text.AutoText`, which
+  parses a leading tag as rich text, so a device named `<img src="http://…">`
+  made the panel issue an HTTP request — against this plugin's documented
+  no-network behaviour. Every label is now pinned to `Text.PlainText` and shown
+  verbatim, and a selftest guard keeps it that way.
+- A root `preview.png` was added so the listing has a real preview image.
 
 ### Changed
 - **Both columns share one 32px row height.** Output rows had been two lines
